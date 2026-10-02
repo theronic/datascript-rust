@@ -51,21 +51,31 @@ export async function instantiate(source) {
   exports = made.instance.exports;
   if (exports.ds_abi_version() !== 1) throw new Error(`datascript.wasm speaks interface ${exports.ds_abi_version()}, this host interface 1`);
 
+  // whether a call did not return and the module has not been told yet
+  let unrecovered = false;
+  const recover = () => {
+    exports.ds_recover();
+    unrecovered = false;
+  };
+
   /** One operation, as EDN: its answer, as EDN. */
   function call(edn) {
+    if (unrecovered) recover();
     const bytes = encoder.encode(edn);
-    // memory the module takes over, and frees
-    const ptr = exports.ds_alloc(bytes.length);
-    new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
     // The module runs on this stack. Should the stack run out under it, the engine ends the call where it stands:
-    // the module's own stack is put back where it was, and the module told, before the error goes on its way.
+    // the module's own stack is put back where it was, and the module told, before the error goes on its way. Where
+    // the stack is still too short for the telling, the module is told before the next call.
     const top = exports.__stack_pointer.value;
     let status;
     try {
+      // memory the module takes over, and frees
+      const ptr = exports.ds_alloc(bytes.length);
+      new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
       status = exports.ds_edn(ptr, bytes.length);
     } catch (e) {
       exports.__stack_pointer.value = top;
-      exports.ds_recover();
+      unrecovered = true;
+      recover();
       throw e;
     }
     // the answer stays where it is until the next call

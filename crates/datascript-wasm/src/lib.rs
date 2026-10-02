@@ -30,9 +30,19 @@
 //! has the same limit, and tells of it with the same error — ends the call with the host's error, with nothing
 //! unwound; so does a host that calls the module with its own stack all but used up, a deep recursion of its own
 //! that reads the database at every level. The host then puts the exported `__stack_pointer` back to what it was
-//! before the call and calls `ds_recover()`. The databases it holds are as they were: the module holds no lock, and
-//! nothing half set, that a call cut short could leave shut (`datascript::lock`). What that call had allocated is
-//! not freed.
+//! before the call and calls `ds_recover()`; where its stack is still too short to call anything, it calls
+//! `ds_recover()` before the next thing it asks of the module.
+//!
+//! An engine ends such a call where a function is entered, and nowhere between. The module is written for that:
+//!
+//! - It holds no lock, and sets no flag, that a call cut short could leave shut (`datascript::lock`).
+//! - What it keeps from one call to the next changes by one value stored, or only grows: the tables of handles
+//!   (`state`), the names (`datascript::named`), the parsed queries and pull patterns (`datascript::lru`).
+//! - Its allocator calls nothing while its lists are half changed (`heap`).
+//!
+//! So the databases the host holds are as they were, and answer as they did. What the call had allocated is not
+//! freed, and what it had hold of is not let go of: a database it was reading stays in the module for good, though
+//! the host give its handle back.
 //!
 //! `ds_edn(ptr, len)` is the same database for a host that would rather write EDN than encode values (`edn_api`).
 
@@ -44,6 +54,7 @@
 
 pub mod codec;
 pub mod edn_api;
+pub mod heap;
 pub mod host;
 pub mod ops;
 pub mod state;
@@ -55,6 +66,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The interface's version: a host checks it against the one it was written for.
 pub const ABI_VERSION: u32 = 1;
+
+/// The module's memory is its own allocator's (`heap`): one that a call cut short cannot leave half changed.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+#[global_allocator]
+static HEAP: heap::ModuleHeap<heap::Memory> = heap::ModuleHeap::new(heap::Memory);
 
 thread_local! {
     static RESULT: Slot<Vec<u8>> = const { Slot::new(Vec::new()) };

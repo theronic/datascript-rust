@@ -206,7 +206,9 @@
 
 (defn- enc-open
   "A writer. A call made while another is being written — a lazy sequence that queries as it is
-  read — gets its own."
+  read — gets its own. Whoever opens one puts enc-depth back to what it was when it is done, in a
+  finally and with set! alone: where the stack has run out, nothing can be called, and a number can
+  still be stored."
   []
   (let [depth enc-depth
         e     (or (aget enc-pool depth)
@@ -218,9 +220,6 @@
     (set! (.-pos e) 0)
     (set! (.-depth e) 0)
     e))
-
-(defn- enc-close []
-  (set! enc-depth (dec enc-depth)))
 
 (defn- room! [^Enc e n]
   (let [need (+ (.-pos e) n)
@@ -913,35 +912,46 @@
 
 ;; The module lets go of a function or a value of the host's as soon as it has no use for it, which may
 ;; be before the host has read the answer that names it: what is let go of during a call waits until
-;; the call has been read.
+;; the call has been read. Each is one number, twice the handle and its kind.
 (def ^:private calls 0)
 (def ^:private let-go (array))
 
 (defn- host-release [kind handle]
   (if (pos? calls)
-    (.push let-go kind handle)
+    (.push let-go (+ (* 2 handle) kind))
     (release! (if (== kind 0) host-fns host-objs) handle)))
 
-(defn- call-ended! []
-  (set! calls (dec calls))
-  (when (and (zero? calls) (pos? (.-length let-go)))
-    (let [pending let-go]
-      (set! let-go (array))
-      (loop [i 0]
-        (when (< i (.-length pending))
-          (release! (if (== (aget pending i) 0) host-fns host-objs) (aget pending (inc i)))
-          (recur (+ i 2)))))))
+(defn- released!
+  "Lets go of what waited for the calls that have now been read: one at a time, so that what stops
+  this — the stack, run out — leaves the rest waiting for the next call to end."
+  []
+  (loop []
+    (when (pos? (.-length let-go))
+      (let [entry (.pop let-go)
+            kind  (js-mod entry 2)]
+        (release! (if (== kind 0) host-fns host-objs) (/ (- entry kind) 2))
+        (recur)))))
+
+;; A call that did not return leaves the module to be put in order (ds_recover). Where that cannot be
+;; done at once — the stack that ran out under the call is no deeper under what catches it — it is done
+;; before the next call.
+(def ^:private unrecovered false)
+
+(defn- recover! []
+  (ds-recover)
+  (set! unrecovered false))
 
 (defn- ds-call-with
   "Writes an operation's arguments and calls it: the status it answers."
   [op ^array args]
-  (let [e   (enc-open)
+  (let [depth enc-depth
+        e     (enc-open)
         ;; the writer is given back whatever writing comes to
-        ptr (try
-              (w-array e t-vector args)
-              (written e)
-              (finally
-                (enc-close)))]
+        ptr   (try
+                (w-array e t-vector args)
+                (written e)
+                (finally
+                  (set! enc-depth depth)))]
     (ds-call op ptr (.-pos e))))
 
 (defn call
@@ -949,8 +959,11 @@
   [op ^array args]
   (when (nil? ds-call)
     (throw (js/Error. "DataScript's WebAssembly module is not loaded: datascript.wasm/instantiate first")))
-  (set! calls (inc calls))
-  (try
+  (when unrecovered
+    (recover!))
+  (let [outer calls]
+   (set! calls (inc outer))
+   (try
     (let [top    (.-value stack-pointer)
           status (try
                    (ds-call-with op args)
@@ -958,7 +971,8 @@
                      ;; The call did not return: the stack ran out under it, or the module gave up. Its
                      ;; own stack is put back where it was, and what it was in the middle of is let go of.
                      (set! (.-value stack-pointer) top)
-                     (ds-recover)
+                     (set! unrecovered true)
+                     (recover!)
                      (throw e)))
           v      (read-at (unsigned-bit-shift-right (ds-result-ptr) 0))]
       (if (== status 0)
@@ -971,7 +985,11 @@
               (some? (nth v 1)) (ex-info (nth v 0) (nth v 1))
               :else             (js/Error. (nth v 0)))))))
     (finally
-      (call-ended!))))
+      ;; the count is put back by a store, which nothing can stop: it is what the stack running out
+      ;; must not leave wrong, or nothing would be let go of again
+      (set! calls outer)
+      (when (and (zero? outer) (pos? (.-length let-go)))
+        (released!))))))
 
 ;; ---------------------------------------------------------------- being called
 
@@ -1020,15 +1038,17 @@
           (false? result) 3
           (true? result)  4
           :else
-          (let [e (enc-open)]
+          (let [depth enc-depth
+                e     (enc-open)]
             (try
               (w-value e result)
               (reply! e)
               (finally
-                (enc-close)))
+                (set! enc-depth depth)))
             0)))
       (catch :default ex
-        (let [e (enc-open)]
+        (let [depth enc-depth
+              e     (enc-open)]
           (try
             (w-byte e t-vector)
             (w-varint e 3)
@@ -1037,7 +1057,7 @@
             (w-host-obj e ex)
             (reply! e)
             (finally
-              (enc-close))))
+              (set! enc-depth depth))))
         1))))
 
 (defn- reply-string! [s]
@@ -1106,6 +1126,7 @@
     (set! kws (array))
     (set! syms (array))
     (set! mem-u8 (js/Uint8Array. 0))
+    (set! unrecovered false)
     (when (some? on-attach)
       (on-attach))
     (set! stack-pointer (gobj/get exports "__stack_pointer"))

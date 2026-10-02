@@ -10,6 +10,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -q -p datascript --example hello > /dev/null
 RUSTFLAGS='-D warnings' cargo build --locked -p datascript-wasm --target wasm32-unknown-unknown --profile wasm-release
+# the module once more with its names, which is how its allocator's functions are found and read
+CARGO_PROFILE_WASM_RELEASE_STRIP=none RUSTFLAGS='-D warnings' cargo build --locked -p datascript-wasm --target wasm32-unknown-unknown --profile wasm-release --target-dir target/named
+node crates/datascript-wasm/js/leaf-check.mjs target/named/wasm32-unknown-unknown/wasm-release/datascript_wasm.wasm
 
 ./conformance/run.sh
 ./conformance/run-wasm.sh

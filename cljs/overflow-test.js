@@ -5,7 +5,7 @@
 //   node cljs/overflow-test.js [rounds]      over cljs/target/js/datascript.js (cljs/js-api.sh), DATASCRIPT_WASM
 const fs = require('fs'), path = require('path');
 const d = require(path.join(__dirname, 'target/js/datascript.js'));
-d.instantiate_sync(fs.readFileSync(process.env.DATASCRIPT_WASM));
+const instance = d.instantiate_sync(fs.readFileSync(process.env.DATASCRIPT_WASM));
 
 const schema = { friend: { ':db/valueType': ':db.type/ref' }, aka: { ':db/cardinality': ':db.cardinality/many' }, name: { ':db/index': true } };
 const fresh = () => {
@@ -44,24 +44,34 @@ const asked = [
 function dive(db, ask, n) { ask(db, n); return dive(db, ask, n + 1) + 1; }
 function from(depth, f, a, b) { return depth === 0 ? f() : from(depth - 1, f, a, b) + 0; }
 
-const rounds = +process.argv[2] || 300;
-let ranOut = 0;
-for (let round = 0; round < rounds; round++) {
-  try {
-    from((round * 13) % 211, () => dive(d.db(conn), asked[round % asked.length], 0), 1, 2);
-  } catch (e) {
-    if (e instanceof RangeError) ranOut++;
+// Between rounds the event loop gets a turn, and the garbage collector too where it can be asked (node --expose-gc):
+// the database values a round made are the module's to drop only once the collector has found them unreachable, and a
+// round makes thousands.
+const turn = () => new Promise((resolve) => { if (global.gc) global.gc(); setImmediate(resolve); });
+
+(async () => {
+  const rounds = +process.argv[2] || 300;
+  let ranOut = 0;
+  for (let round = 0; round < rounds; round++) {
+    try {
+      from((round * 13) % 211 + (round % 7) * 3, () => dive(d.db(conn), asked[round % asked.length], 0), 1, 2);
+    } catch (e) {
+      if (e instanceof RangeError) ranOut++;
+    }
+    let got;
+    try {
+      conn = fresh(); // what the recursion transacted is left behind
+      got = answer(conn);
+    } catch (e) {
+      got = `an error: ${(e && e.message) || e}`;
+    }
+    if (got !== expected) {
+      console.error(`after the stack ran out ${ranOut} times, in round ${round}, the module answers ${got.slice(0, 200)}`);
+      process.exit(1);
+    }
+    await turn();
+    await turn();
   }
-  let got;
-  try {
-    conn = fresh(); // what the recursion transacted is left behind
-    got = answer(conn);
-  } catch (e) {
-    got = `an error: ${(e && e.message) || e}`;
-  }
-  if (got !== expected) {
-    console.error(`after the stack ran out ${ranOut} times, in round ${round}, the module answers ${got.slice(0, 200)}`);
-    process.exit(1);
-  }
-}
-console.log(`the stack ran out under the module ${ranOut} times in ${rounds} rounds, and it answers as it did`);
+  const mb = Math.round(instance.exports.memory.buffer.byteLength / 1048576);
+  console.log(`the stack ran out under the module ${ranOut} times in ${rounds} rounds, and it answers as it did (its memory: ${mb} MB)`);
+})();

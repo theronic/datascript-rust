@@ -86,9 +86,13 @@ The database is in the module, and a value on its way in or out is written into 
 
 The module runs on its host's stack. When that runs out under it, in a recursion of the program's own that reads the
 database at every level, or over a value nested too deep to hash or print, JavaScript's `RangeError` is what the
-program is thrown, as it would be by ClojureScript DataScript, and the module is as it was before the call: it keeps
-nothing locked or half set that a call cut short could leave so, and the interface puts its stack back
-(`cljs/overflow-test.js` runs the stack out under it some thousand times).
+program is thrown, as it would be by ClojureScript DataScript, and the databases the program holds are as they were
+before the call. The engine ends the call where it stands, with nothing unwound, so that is by how the module is
+written: it keeps nothing locked, what it keeps between calls changes by one value stored at a time, and its
+allocator (`crates/datascript-wasm/src/heap.rs`) calls nothing while its own lists are half changed, which the
+standard library's does. `cljs/overflow-test.js` runs the stack out under the module some hundreds of times, at a
+different place each time, and the module's memory is all that shows it: what a call that was cut short had allocated
+is not freed, and a database it was reading is not let go of, though the program lose every other hold on it.
 
 ### What differs
 
@@ -176,6 +180,7 @@ Values are ClojureScript's (`Value`): numbers are doubles, and maps and sets ite
 ## How it is checked
 
 ```bash
+./script/test_rust.sh              # all of the below, the lints, and the allocator's functions read in the built module
 cargo test --workspace             # the crates' own tests
 ./conformance/run.sh               # the Rust library against ClojureScript DataScript
 ./conformance/run-wasm.sh          # the module, behind its ClojureScript interface, against ClojureScript DataScript
@@ -198,6 +203,24 @@ the module in Node, with `:simple` and `:advanced` optimizations, beside tests o
 (`cljs/test/datascript/test/wasm.cljs`): values that keep their identity, exceptions, long runs of datoms, values
 nested 20,000 deep, the stack running out and the module carrying on, and databases being let go of when the garbage
 collector says so.
+
+## How much memory it takes
+
+The same as ClojureScript DataScript, for the database itself. 100,000 entities of six attributes, 600,000 datoms,
+transacted ten thousand entities at a time through DataScript's JavaScript API, in Node:
+
+| | ClojureScript's heap | the module's memory |
+|---|---:|---:|
+| the database loaded | 103 MB | 103 MB |
+| after 50,000 transactions of one datom | 101 MB | 107 MB |
+| after `serializable` | 117 MB | 271 MB |
+
+The module's memory is the most it has needed at once: WebAssembly's memory grows and is never given back.
+`serializable` builds the whole of what it answers before any of it crosses, 19 MB of JSON here, and what it took to
+build stays the module's, free for whatever the module needs next.
+
+A node of an index holds what it has and room for one datom more, where a vector that doubles would have left the
+indexes half empty: the database above took 149 MB before its nodes were made to fit.
 
 ## How fast it is
 

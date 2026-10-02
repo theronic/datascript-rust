@@ -51,6 +51,7 @@ pub(crate) struct Plain {
     indexes: Lock<Indexes>,
     /// How many times the indexes were made again: a place in them (`Cursor::place`) is good for one making
     epoch: AtomicU32,
+    mark: AtomicU32,
 }
 
 enum Indexes {
@@ -80,6 +81,7 @@ impl Plain {
             hash: HashCache::new(),
             indexes: Lock::new(Indexes::Here(Arc::new(core))),
             epoch: AtomicU32::new(0),
+            mark: AtomicU32::new(0),
         }
     }
 
@@ -129,6 +131,7 @@ pub(crate) struct Filtered {
     unfiltered: Db,
     pred: Pred,
     hash: HashCache,
+    mark: AtomicU32,
 }
 
 /// What searching needs of a database: the indexes, and the predicate of a filtered one. A transaction searches the
@@ -1179,7 +1182,12 @@ impl Db {
             Some(first) => Arc::new(move |d| Ok(first(d)? && pred(&of, d)?)),
             None => Arc::new(move |d| pred(&of, d)),
         };
-        Db(Arc::new(DbRepr::Filtered(Filtered { unfiltered, pred: combined, hash: HashCache::new() })))
+        Db(Arc::new(DbRepr::Filtered(Filtered {
+            unfiltered,
+            pred: combined,
+            hash: HashCache::new(),
+            mark: AtomicU32::new(0),
+        })))
     }
 
     #[inline]
@@ -1204,6 +1212,16 @@ impl Db {
     /// A number that is this value's alone while it lives, as ClojureScript hashes an entity by its database's id.
     pub fn identity(&self) -> usize {
         Arc::as_ptr(&self.0) as *const () as usize
+    }
+
+    /// A number for whoever keeps database values in a table of their own to put on this one, 0 until they do: the
+    /// WebAssembly module's handle for a value its host holds, so that the same value is the same handle with no
+    /// table of values to keep beside the table of handles.
+    pub fn mark(&self) -> &AtomicU32 {
+        match &*self.0 {
+            DbRepr::Plain(plain) => &plain.mark,
+            DbRepr::Filtered(filtered) => &filtered.mark,
+        }
     }
 
     /// `(:schema db)`: the schema as given, a map or `nil`.

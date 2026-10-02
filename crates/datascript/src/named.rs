@@ -78,8 +78,10 @@ fn intern(kind: Kind, full: &str) -> &'static Named {
     let id = t.by_id.len() as u32;
     let named: &'static Named =
         Box::leak(Box::new(Named { kind, id, ns: ns.map(Box::from), name: Box::from(name), full: full.clone(), hash }));
-    t.by_name.insert(full, named);
+    // by number first: should the call be cut short between the two, the name is numbered again the next time
+    // it is met, and no number is ever two names'
     t.by_id.push(named);
+    t.by_name.insert(full, named);
     named
 }
 

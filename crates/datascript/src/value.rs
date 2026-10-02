@@ -128,6 +128,7 @@ struct FuncInner {
     host: Option<Arc<dyn Any + Send + Sync>>,
     /// Whether it is a ClojureScript type, which prints as its name
     constructor: bool,
+    mark: AtomicU32,
 }
 
 impl Func {
@@ -141,6 +142,7 @@ impl Func {
             f: Box::new(f),
             host: None,
             constructor: false,
+            mark: AtomicU32::new(0),
         }))
     }
 
@@ -155,6 +157,7 @@ impl Func {
             f: Box::new(f),
             host: None,
             constructor: true,
+            mark: AtomicU32::new(0),
         }))
     }
 
@@ -174,6 +177,7 @@ impl Func {
             f: Box::new(f),
             host: Some(handle),
             constructor: false,
+            mark: AtomicU32::new(0),
         }))
     }
 
@@ -193,6 +197,12 @@ impl Func {
     #[inline]
     pub fn id(&self) -> u32 {
         self.0.id
+    }
+
+    /// A number for whoever keeps functions in a table of their own to put on this one, 0 until they do
+    /// (`Db::mark`).
+    pub fn mark(&self) -> &AtomicU32 {
+        &self.0.mark
     }
 
     #[inline]

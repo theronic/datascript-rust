@@ -26,4 +26,4 @@ echo "cljs/target/js/datascript.js ($(wc -c < cljs/target/js/datascript.js | tr 
 
 DATASCRIPT_WASM="$WASM" node cljs/js-api-test.js
 # and the stack run out under the module, some hundreds of times
-DATASCRIPT_WASM="$WASM" node cljs/overflow-test.js "${OVERFLOWS:-300}"
+DATASCRIPT_WASM="$WASM" node --expose-gc cljs/overflow-test.js "${OVERFLOWS:-300}"

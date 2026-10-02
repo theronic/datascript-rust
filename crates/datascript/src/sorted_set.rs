@@ -13,8 +13,12 @@ const MIN_LEN: usize = MAX_LEN / 2;
 /// Leaves are built this full by `from_sorted`
 const AVG_LEN: usize = (MAX_LEN + MIN_LEN) / 2;
 const MAX_DEPTH: usize = 12;
+/// How many more elements a node that is full gets room for at a time. A node is copied with room for one more,
+/// which is what a transaction most often adds to it. One that goes on being added to — the last leaf, while a
+/// database is loaded in order — is made longer this much at a time and not doubled: most nodes are never added to
+/// again, and the room that doubling leaves in them comes to as much memory as the datoms themselves.
+const ROOM: usize = 4;
 
-#[derive(Clone)]
 enum Node<T> {
     Leaf(Vec<T>),
     Branch {
@@ -22,6 +26,44 @@ enum Node<T> {
         keys: Vec<T>,
         children: Vec<Arc<Node<T>>>,
     },
+}
+
+/// A copy with room for one more.
+fn with_room<X: Clone>(items: &[X]) -> Vec<X> {
+    let mut copy = Vec::with_capacity(items.len() + 1);
+    copy.extend_from_slice(items);
+    copy
+}
+
+/// `insert`, into a vector that grows by `ROOM`.
+fn insert_at<X>(items: &mut Vec<X>, i: usize, x: X) {
+    if items.len() == items.capacity() {
+        items.reserve_exact(ROOM);
+    }
+    items.insert(i, x);
+}
+
+/// `split_off`, of a vector that then keeps no more room than it has elements.
+fn split_at<X>(items: &mut Vec<X>, at: usize) -> Vec<X> {
+    let right = items.split_off(at);
+    items.shrink_to_fit();
+    right
+}
+
+/// `append`, of exactly as much.
+fn append_all<X>(items: &mut Vec<X>, more: &mut Vec<X>) {
+    items.reserve_exact(more.len());
+    items.append(more);
+}
+
+/// A node is copied to be changed: a transaction's own copy of a node it shares with the database before it.
+impl<T: Clone> Clone for Node<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Node::Leaf(items) => Node::Leaf(with_room(items)),
+            Node::Branch { keys, children } => Node::Branch { keys: with_room(keys), children: with_room(children) },
+        }
+    }
 }
 
 impl<T: Clone> Node<T> {
@@ -389,9 +431,9 @@ fn insert<T: Clone>(node: &mut Arc<Node<T>>, x: T, cmp: &impl Fn(&T, &T) -> Orde
                 return Inserted::No;
             }
             let Node::Leaf(items) = Arc::make_mut(node) else { unreachable!() };
-            items.insert(i, x);
+            insert_at(items, i, x);
             if items.len() > MAX_LEN {
-                let right = items.split_off(items.len() / 2);
+                let right = split_at(items, items.len() / 2);
                 Inserted::Split(Arc::new(Node::Leaf(right)))
             } else {
                 Inserted::Yes
@@ -414,12 +456,12 @@ fn insert<T: Clone>(node: &mut Arc<Node<T>>, x: T, cmp: &impl Fn(&T, &T) -> Orde
                 }
                 Inserted::Split(right) => {
                     keys[i] = children[i].max().expect("child").clone();
-                    keys.insert(i + 1, right.max().expect("right").clone());
-                    children.insert(i + 1, right);
+                    insert_at(keys, i + 1, right.max().expect("right").clone());
+                    insert_at(children, i + 1, right);
                     if children.len() > MAX_LEN {
                         let at = children.len() / 2;
-                        let right_children = children.split_off(at);
-                        let right_keys = keys.split_off(at);
+                        let right_children = split_at(children, at);
+                        let right_keys = split_at(keys, at);
                         Inserted::Split(Arc::new(Node::Branch { keys: right_keys, children: right_children }))
                     } else {
                         Inserted::Yes
@@ -475,21 +517,21 @@ fn rebalance<T: Clone>(keys: &mut Vec<T>, children: &mut Vec<Arc<Node<T>>>, l: u
     let left = Arc::make_mut(&mut children[l]);
     match (left, right) {
         (Node::Leaf(a), Node::Leaf(mut b)) => {
-            a.append(&mut b);
+            append_all(a, &mut b);
             if total > MAX_LEN {
-                let b = a.split_off(total / 2);
-                keys.insert(r, b.last().expect("right").clone());
-                children.insert(r, Arc::new(Node::Leaf(b)));
+                let b = split_at(a, total / 2);
+                insert_at(keys, r, b.last().expect("right").clone());
+                insert_at(children, r, Arc::new(Node::Leaf(b)));
             }
         }
         (Node::Branch { keys: ak, children: ac }, Node::Branch { keys: mut bk, children: mut bc }) => {
-            ak.append(&mut bk);
-            ac.append(&mut bc);
+            append_all(ak, &mut bk);
+            append_all(ac, &mut bc);
             if total > MAX_LEN {
-                let bc = ac.split_off(total / 2);
-                let bk = ak.split_off(total / 2);
-                keys.insert(r, bk.last().expect("right").clone());
-                children.insert(r, Arc::new(Node::Branch { keys: bk, children: bc }));
+                let bc = split_at(ac, total / 2);
+                let bk = split_at(ak, total / 2);
+                insert_at(keys, r, bk.last().expect("right").clone());
+                insert_at(children, r, Arc::new(Node::Branch { keys: bk, children: bc }));
             }
         }
         _ => unreachable!("neighbours are of one level"),
