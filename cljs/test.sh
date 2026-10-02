@@ -21,4 +21,4 @@ clojure -Sdeps "$DEPS" -M -m cljs.main \
   -o "cljs/target/test-$OPT/test.js" \
   -c datascript.wasm-test
 
-DATASCRIPT_WASM="$WASM" node "cljs/target/test-$OPT/test.js"
+DATASCRIPT_WASM="$WASM" node --expose-gc "cljs/target/test-$OPT/test.js"

@@ -193,6 +193,11 @@ fn auto_tempids_entity(db: &DbCore, entity: &Value) -> Result<Value> {
             }
             Ok(Value::map(out))
         }
+        // a map the host has, and the port has no form for: a record is transacted as the map it is
+        Value::Host(h) => match h.0.as_map()? {
+            Some(map) => auto_tempids_entity(db, &map),
+            None => Ok(entity.clone()),
+        },
         Value::Vector(items) | Value::List(items) => {
             let get = |i: usize| items.get(i).cloned().unwrap_or(Value::Nil);
             let (op, e, a, v) = (get(0), get(1), get(2), get(3));

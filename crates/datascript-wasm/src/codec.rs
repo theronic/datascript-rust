@@ -55,6 +55,8 @@ pub const MODULE_FN: u8 = 23;
 /// a database as the module names one: its handle, its schema's number, max-eid and max-tx (zigzag), and whether
 /// it is filtered (a byte)
 pub const DB_INFO: u8 = 24;
+/// a type, as `type` answers one: its name, which the host has the constructor of
+pub const TYPE: u8 = 25;
 
 pub struct Writer {
     pub buf: Vec<u8>,
@@ -210,12 +212,18 @@ impl Writer {
                     self.byte(HOST_FN);
                     self.varint(handle as u64);
                 }
-                None => {
-                    let handle = with_state(|state| state.module_fn_handle(f));
-                    self.byte(MODULE_FN);
-                    self.varint(handle as u64);
-                    self.str(f.name());
-                }
+                None => match datascript::built_ins::type_name_of(f) {
+                    Some(name) => {
+                        self.byte(TYPE);
+                        self.str(&name);
+                    }
+                    None => {
+                        let handle = with_state(|state| state.module_fn_handle(f));
+                        self.byte(MODULE_FN);
+                        self.varint(handle as u64);
+                        self.str(f.name());
+                    }
+                },
             },
             Value::Host(h) => match crate::host::object_handle(h) {
                 Some((handle, hash)) => {
@@ -392,7 +400,10 @@ impl<'a> Reader<'a> {
             KW_REF => {
                 let id = self.varint()? as usize;
                 Value::Keyword(
-                    self.keywords.get(id).cloned().ok_or_else(|| Error::msg("datascript: no keyword of that number"))?,
+                    self.keywords
+                        .get(id)
+                        .cloned()
+                        .ok_or_else(|| Error::msg("datascript: no keyword of that number"))?,
                 )
             }
             SYM_DEF => {
@@ -441,7 +452,8 @@ impl<'a> Reader<'a> {
             }
             DB_INFO => {
                 let handle = self.varint()? as u32;
-                let (_schema, _max_eid, _max_tx, _filtered) = (self.varint()?, self.zigzag()?, self.zigzag()?, self.byte()?);
+                let (_schema, _max_eid, _max_tx, _filtered) =
+                    (self.varint()?, self.zigzag()?, self.zigzag()?, self.byte()?);
                 Value::Db(with_state(|state| state.db(handle))?)
             }
             HOST_FN => {
@@ -458,6 +470,7 @@ impl<'a> Reader<'a> {
                 let _name = self.str()?;
                 Value::Fn(with_state(|state| state.module_fn(handle))?)
             }
+            TYPE => Value::Fn(datascript::built_ins::type_named(self.str()?)),
             other => return Err(Error::msg(format!("datascript: the message has a value of no known kind ({other})"))),
         }))
     }
@@ -485,10 +498,23 @@ impl<'a> Reader<'a> {
 
 /// A collection that is being read: what it has so far, and how much is to come.
 enum Partial {
-    Items { tag: u8, items: Vec<Value>, left: usize },
-    Pairs { tag: u8, pairs: Vec<(Value, Value)>, key: Option<Value>, left: usize },
+    Items {
+        tag: u8,
+        items: Vec<Value>,
+        left: usize,
+    },
+    Pairs {
+        tag: u8,
+        pairs: Vec<(Value, Value)>,
+        key: Option<Value>,
+        left: usize,
+    },
     /// A datom, whose attribute and value are values like any other
-    Datom { e: i64, a: Option<Value>, v: Option<Value> },
+    Datom {
+        e: i64,
+        a: Option<Value>,
+        v: Option<Value>,
+    },
 }
 
 impl Partial {

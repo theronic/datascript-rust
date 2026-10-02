@@ -226,6 +226,34 @@ pub trait HostObject: Send + Sync + 'static {
     fn compare(&self, _other: &dyn HostObject) -> Option<Ordering> {
         None
     }
+    /// `(get x k not-found)`, of a value the host looks into. `None` of one that nothing is asked of.
+    fn lookup(&self, _k: &Value, _not_found: &Value) -> Option<Result<Value>> {
+        None
+    }
+    /// `(count x)`
+    fn count(&self) -> Option<Result<usize>> {
+        None
+    }
+    /// Whether `(seq x)` is asked of it: ClojureScript's `seqable?`
+    fn seqable(&self) -> bool {
+        false
+    }
+    /// `(seq x)`: its elements
+    fn seq(&self) -> Option<Result<Vec<Value>>> {
+        None
+    }
+    /// `(contains? x k)`
+    fn contains(&self, _k: &Value) -> Option<Result<bool>> {
+        None
+    }
+    /// `(apply x args)`, of a value that can be called
+    fn invoke(&self, _args: &[Value]) -> Option<Result<Value>> {
+        None
+    }
+    /// The map it is, when it is one that the port has no form of its own for: a record
+    fn as_map(&self) -> Result<Option<Value>> {
+        Ok(None)
+    }
     fn as_any(&self) -> &dyn Any;
     /// Itself as a shared `Any`, for a type that is handed back out as what it is.
     fn as_arc_any(self: Arc<Self>) -> Option<Arc<dyn Any + Send + Sync>> {
@@ -475,7 +503,11 @@ impl Value {
     /// DataScript's `seqable?`: a collection, a datom, or `nil`; not a string.
     #[inline]
     pub fn is_seqable(&self) -> bool {
-        matches!(self, Value::Nil | Value::Vector(_) | Value::List(_) | Value::Map(_) | Value::Set(_) | Value::Datom(_))
+        match self {
+            Value::Nil | Value::Vector(_) | Value::List(_) | Value::Map(_) | Value::Set(_) | Value::Datom(_) => true,
+            Value::Host(h) => crate::clj::host_seqable(h),
+            _ => false,
+        }
     }
 
     #[inline]
@@ -585,6 +617,7 @@ impl Value {
             Value::Set(s) => Some(s.len()),
             Value::Str(s) => Some(s.encode_utf16().count()),
             Value::Datom(_) => Some(5),
+            Value::Host(h) => crate::clj::host_count(h).and_then(|n| n.ok()),
             _ => None,
         }
     }
@@ -598,6 +631,7 @@ impl Value {
             Value::Set(s) => Some(s.iter().cloned().collect()),
             Value::Datom(d) => Some(d.seq_values()),
             Value::Str(s) => Some(crate::print::string_chars(s)),
+            Value::Host(h) => crate::clj::host_seq(h).and_then(|items| items.ok()),
             _ => None,
         }
     }

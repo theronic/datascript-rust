@@ -4,8 +4,7 @@
 set -o errexit -o nounset -o pipefail
 cd "$(dirname "$0")/.."
 
-if [ ! -f conformance/oracle/target/oracle.js ] || [ conformance/oracle/src/oracle/core.cljs -nt conformance/oracle/target/oracle.js ] \
-   || [ -n "$(find src -newer conformance/oracle/target/oracle.js -name '*.clj*' -print -quit)" ]; then
+if [ ! -f conformance/oracle/target/oracle.js ] || [ -n "$(find src conformance/oracle/src -newer conformance/oracle/target/oracle.js -name '*.clj*' -print -quit)" ]; then
   conformance/oracle/build.sh >&2
 fi
 cargo build --quiet --release -p conformance

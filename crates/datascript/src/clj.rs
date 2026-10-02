@@ -2,9 +2,10 @@
 //! query may call by name, and the ones the port itself needs to build a collection as ClojureScript would.
 
 use crate::coll::{CljMap, CljSet};
+use crate::entity::Entity;
 use crate::error::{Error, Result};
 use crate::print::pr_str;
-use crate::value::Value;
+use crate::value::{HostObj, Value};
 use std::sync::Arc;
 
 /// `(conj coll x)`: onto the end of a vector, the front of a list, into a set, an entry into a map. `nil` is an
@@ -106,6 +107,62 @@ pub fn select_keys(m: &Value, ks: &[Value]) -> Value {
     Value::map(out)
 }
 
+// ---------------------------------------------------------------- values that answer for themselves
+//
+// An entity, or a value of the host's: what ClojureScript asks of the value's own protocols is asked of it.
+
+/// `(get x k not-found)`
+pub fn host_get(h: &HostObj, k: &Value, not_found: &Value) -> Result<Value> {
+    if let Some(e) = Entity::from_host(h) {
+        return Ok(e.lookup_entry(k)?.unwrap_or_else(|| not_found.clone()));
+    }
+    h.0.lookup(k, not_found).unwrap_or_else(|| Ok(not_found.clone()))
+}
+
+/// `(count x)`; `None` of a value that has none.
+pub fn host_count(h: &HostObj) -> Option<Result<usize>> {
+    match Entity::from_host(h) {
+        Some(e) => Some(e.entries().map(|entries| entries.len())),
+        None => h.0.count(),
+    }
+}
+
+/// ClojureScript's `seqable?`
+pub fn host_seqable(h: &HostObj) -> bool {
+    Entity::from_host(h).is_some() || h.0.seqable()
+}
+
+/// `(seq x)`; `None` of a value that is no sequence.
+pub fn host_seq(h: &HostObj) -> Option<Result<Vec<Value>>> {
+    match Entity::from_host(h) {
+        Some(e) => {
+            Some(e.entries().map(|entries| entries.into_iter().map(|(k, v)| Value::vector(vec![k, v])).collect()))
+        }
+        None => h.0.seq(),
+    }
+}
+
+/// `(contains? x k)`
+pub fn host_contains(h: &HostObj, k: &Value) -> Result<bool> {
+    match Entity::from_host(h) {
+        Some(e) => e.contains_key(k),
+        None => h.0.contains(k).unwrap_or(Ok(false)),
+    }
+}
+
+/// `(apply x args)`; `None` of a value that is not called.
+pub fn host_invoke(h: &HostObj, args: &[Value]) -> Option<Result<Value>> {
+    static NIL: Value = Value::Nil;
+    match Entity::from_host(h) {
+        // an entity looks the attribute up in itself
+        Some(e) => Some(
+            e.lookup_entry(args.first().unwrap_or(&NIL))
+                .map(|v| v.unwrap_or_else(|| args.get(1).unwrap_or(&NIL).clone())),
+        ),
+        None => h.0.invoke(args),
+    }
+}
+
 /// `(get coll k)`: a map's value, a set's element, a vector's or string's nth; `None` when there is none.
 pub fn get(coll: &Value, k: &Value) -> Option<Value> {
     match coll {
@@ -143,6 +200,7 @@ pub fn contains(coll: &Value, k: &Value) -> Result<bool> {
             Ok(k.as_num().is_some_and(|i| i.fract() == 0.0 && i >= 0.0 && (i as usize) < s.encode_utf16().count()))
         }
         Value::Datom(d) => Ok(d.val_at(k).is_some()),
+        Value::Host(h) => host_contains(h, k),
         // ClojureScript's `contains?` is a `get` that found something: of what has no keys, false
         _ => Ok(false),
     }
@@ -275,6 +333,12 @@ pub fn sort_by<C: FnMut(&Value, &Value) -> Result<std::cmp::Ordering>>(items: &m
 
 /// The elements of a seqable value, or ClojureScript's complaint that it is not one.
 pub fn seq(v: &Value) -> Result<Vec<Value>> {
+    if let Value::Host(h) = v {
+        // what the value itself answers, its own complaint included
+        if let Some(items) = host_seq(h) {
+            return items;
+        }
+    }
     v.seq_items().ok_or_else(|| Error::msg(format!("{} is not ISeqable", crate::print::str_of(v))))
 }
 

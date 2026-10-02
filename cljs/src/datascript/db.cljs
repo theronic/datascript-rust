@@ -35,6 +35,11 @@
 (defn- raise [msg data]
   (throw (ex-info msg data)))
 
+(defn value-compare
+  "The order of values in DataScript's indexes: negative, zero or positive."
+  [x y]
+  (wasm/call wasm/op-compare #js [x y]))
+
 ;; ---------------------------------------------------------------- datoms
 
 (declare hash-datom equiv-datom seq-datom nth-datom assoc-datom val-at-datom)
@@ -503,9 +508,12 @@
           (.set held handle #js [owner value nil]))
         value))))
 
+(wasm/register-type! Datom "datascript.db/Datom")
 (set! wasm/datom-type Datom)
 (set! wasm/datom-ctor datom)
 (set! wasm/db-ctor db-of)
+(wasm/register-type! DB "datascript.db/DB")
+(wasm/register-type! FilteredDB "datascript.db/FilteredDB")
 (set! wasm/db-handle
   (fn [x]
     (cond
@@ -611,7 +619,7 @@
     (boolean (re-matches #"(?:([^/]+)/)?_([^/]+)" attr))
 
     :else
-    (raise (str "Bad attribute type: " attr ", expected keyword or string")
+    (raise (str "Bad attribute type: " (pr-str attr) ", expected keyword or string")
       {:error :transact/syntax, :attribute attr})))
 
 (defn reverse-ref [attr]
@@ -628,7 +636,7 @@
         (if ns (str ns "/_" name) (str "_" name))))
 
     :else
-    (raise (str "Bad attribute type: " attr ", expected keyword or string")
+    (raise (str "Bad attribute type: " (pr-str attr) ", expected keyword or string")
       {:error :transact/syntax, :attribute attr})))
 
 (defn entid [db eid]
@@ -666,5 +674,6 @@
   [initial-report initial-es]
   (let [db      (:db-before initial-report)
         tx-meta (:tx-meta initial-report)
-        [db-after tx-data tempids] (wasm/call wasm/op-with #js [db initial-es tx-meta])]
+        ;; the transaction's metadata stays here: the report carries it, the module has no use for it
+        [db-after tx-data tempids] (wasm/call wasm/op-with #js [db initial-es nil])]
     (TxReport. db db-after tx-data tempids tx-meta)))

@@ -39,9 +39,12 @@
     datascript.test.wasm))
 
 (defn -main [& _]
-  (let [res (datascript.test.core/wrap-res #(t/run-all-tests #"datascript\.test\..*"))]
-    (println "held:" (pr-str (wasm/held)))
-    (when (pos? (+ (gobj/get res "fail") (gobj/get res "error")))
-      (js-invoke js/process "exit" 1))))
+  ;; the tests that wait for the garbage collector end after this function does
+  (add-watch datascript.test.core/test-summary ::done
+    (fn [_ _ _ summary]
+      (println "held:" (pr-str (wasm/held)))
+      (when (pos? (+ (:fail summary) (:error summary)))
+        (js-invoke js/process "exit" 1))))
+  (t/run-all-tests #"datascript\.test\..*"))
 
 (set! *main-cli-fn* -main)

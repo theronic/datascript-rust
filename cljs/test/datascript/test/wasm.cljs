@@ -1,7 +1,212 @@
 (ns datascript.test.wasm
   "What is particular to DataScript over the WebAssembly module: what crosses the boundary, and how."
   (:require
-    [clojure.test :as t :refer [is are deftest testing]]
+    [clojure.test :as t :refer [is are deftest testing async]]
     [datascript.core :as d]
     [datascript.db :as db]
     [datascript.wasm :as wasm]))
+
+(defrecord Point [x y])
+
+(deftype Opaque [n])
+
+(def people
+  (d/db-with (d/empty-db {:friend {:db/valueType :db.type/ref}
+                          :aka    {:db/cardinality :db.cardinality/many}})
+    [{:db/id 1 :name "Ivan" :age 15 :aka ["I" "V"] :friend 2}
+     {:db/id 2 :name "Petr" :age 37}
+     {:db/id 3 :name "Oleg" :age 37 :friend 1}]))
+
+(deftest test-values-keep-their-identity
+  (testing "a value the module has no form for comes back the value it was"
+    (let [o  (Opaque. 1)
+          a  (atom 1)
+          js #js {:a 1}]
+      (is (identical? o (d/q '[:find ?x . :in ?x] o)))
+      (is (identical? a (d/q '[:find ?x . :in ?x] a)))
+      (is (identical? js (d/q '[:find ?x . :in ?x] js)))
+      (is (= #{[o]} (d/q '[:find ?x :in [?x ...]] [o o])))))
+  (testing "as a datom's value"
+    (let [o  (Opaque. 2)
+          p  (->Point 1 2)
+          db (d/db-with (d/empty-db) [[:db/add 1 :obj o] [:db/add 1 :point p]])]
+      (is (identical? o (:obj (d/entity db 1))))
+      (is (identical? p (:v (first (d/datoms db :eavt 1 :point)))))
+      (is (= {:obj o :point p} (d/pull db [:obj :point] 1)))
+      (is (= #{[1]} (d/q '[:find ?e :in $ ?p :where [?e :point ?p]] db (->Point 1 2))))
+      (is (= #{} (d/q '[:find ?e :in $ ?p :where [?e :point ?p]] db {:x 1 :y 2})))))
+  (testing "a function is called with the values it was given"
+    (let [o    (Opaque. 3)
+          seen (atom nil)]
+      (is (= #{[true]} (d/q '[:find ?r :in ?f ?x :where [(?f ?x) ?r]]
+                         (fn [x] (reset! seen x) true) o)))
+      (is (identical? o @seen))))
+  (testing "types are the host's own"
+    (is (identical? js/Number (d/q '[:find ?t . :in ?x :where [(type ?x) ?t]] 1)))
+    (is (identical? Keyword (d/q '[:find ?t . :in ?x :where [(type ?x) ?t]] :k)))
+    (is (identical? Opaque (d/q '[:find ?t . :in ?x :where [(type ?x) ?t]] (Opaque. 4))))
+    (is (identical? Point (d/q '[:find ?t . :in ?x :where [(type ?x) ?t]] (->Point 1 2))))
+    (is (= #{[1]} (d/q '[:find ?x :in [?x ...] ?t :where [(type ?x) ?t]] [1 "a" :b] js/Number)))))
+
+(deftest test-values-the-host-answers-for
+  (testing "a record is the map it is, to a transaction"
+    (let [db (d/db-with (d/empty-db) [(->Point 1 2) (assoc (->Point 3 4) :db/id 10)])]
+      (is (= #{[1 :x 1] [1 :y 2] [10 :x 3] [10 :y 4]}
+            (set (map (juxt :e :a :v) (d/datoms db :eavt)))))))
+  (testing "and to a query's functions"
+    (let [p (->Point 1 2)]
+      (is (= 2 (d/q '[:find ?y . :in ?p :where [(get ?p :y) ?y]] p)))
+      (is (= :none (d/q '[:find ?y . :in ?p :where [(get ?p :z :none) ?y]] p)))
+      (is (= 2 (d/q '[:find ?n . :in ?p :where [(count ?p) ?n]] p)))
+      (is (= true (d/q '[:find ?r . :in ?p :where [(contains? ?p :x) ?r]] p)))
+      (is (= #{[[:x 1]] [[:y 2]]} (d/q '[:find ?kv :in [?kv ...]] p)))))
+  (testing "an entity is asked for its attributes"
+    (let [e (d/entity people 1)]
+      (is (= "Ivan" (d/q '[:find ?n . :in ?e :where [(get ?e :name) ?n]] e)))
+      (is (= "Ivan" (d/q '[:find ?n . :in ?e :where [(?e :name) ?n]] e)))
+      (is (= #{["Ivan"] ["Oleg"]}
+            (d/q '[:find ?n
+                   :in $ [?e ...] ?k
+                   :where [(?k ?e) ?n]]
+              people [(d/entity people 1) (d/entity people 3)] :name)))))
+  (testing "what a value of the host's throws is what the caller is thrown"
+    (let [boom (js/Error. "boom")
+          bad  (reify ICounted (-count [_] (throw boom)))]
+      (is (identical? boom
+            (try (d/q '[:find ?n . :in ?x :where [(count ?x) ?n]] bad)
+              (catch :default e e)))))))
+
+(deftest test-exceptions-pass-through
+  (let [conn (d/create-conn)
+        boom (ex-info "from a transaction function" {:mine true})]
+    (is (identical? boom
+          (try (d/transact! conn [[:db.fn/call (fn [_] (throw boom))]])
+            (catch :default e e))))
+    (is (identical? boom
+          (try (d/q '[:find ?x :in ?f :where [(?f) ?x]] (fn [] (throw boom)))
+            (catch :default e e))))
+    (is (identical? boom
+          (try (vec (d/datoms (d/filter people (fn [_ _] (throw boom))) :eavt))
+            (catch :default e e))))
+    (testing "and the database is as it was"
+      (is (= 0 (count @conn)))
+      (d/transact! conn [[:db/add 1 :name "Ivan"]])
+      (is (= 1 (count @conn))))))
+
+(deftest test-transaction-functions
+  (testing "a function is called with the database of the transaction so far"
+    (let [conn (d/create-conn)
+          seen (atom [])]
+      (d/transact! conn
+        [[:db/add 1 :n 1]
+         [:db.fn/call (fn [db] (swap! seen conj (count db)) [[:db/add 2 :n (count (d/datoms db :eavt))]])]
+         [:db.fn/call (fn [db] (swap! seen conj (:n (d/entity db 2))) #js [])]])
+      (is (= [1 1] @seen))
+      (is (= #{[1 1] [2 1]} (d/q '[:find ?e ?n :where [?e :n ?n]] @conn)))))
+  (testing "JavaScript's arrays are vectors to the module"
+    (let [db (d/db-with (d/empty-db) #js [#js [:db/add 1 :name "Ivan"]])]
+      (is (= #{["Ivan"]} (d/q '[:find ?n :where [_ :name ?n]] db)))
+      (is (= #{[1]} (d/q '[:find ?e :in $ [?n ...] :where [?e :name ?n]] db #js ["Ivan" "Petr"]))))))
+
+(deftest test-reports
+  (let [conn    (d/create-conn)
+        reports (atom [])
+        meta    (atom :tx-meta)]
+    (d/listen! conn :test #(swap! reports conj %))
+    (d/transact! conn [[:db/add 1 :name "Ivan"]] meta)
+    (d/transact! conn [[:db/add 2 :name "Petr"]])
+    (let [[r1 r2] @reports]
+      (is (identical? meta (:tx-meta r1)))
+      (is (identical? (:db-after r1) (:db-before r2)))
+      (is (identical? (:db-after r2) @conn))
+      (is (= [(d/datom 2 :name "Petr" (+ d/tx0 2))] (:tx-data r2))))))
+
+(deftest test-runs-of-datoms
+  (let [n     3000
+        db    (d/db-with (d/empty-db) (for [i (range 1 (inc n))] [:db/add i :n i]))
+        ds    (d/datoms db :eavt)]
+    (is (= n (count ds)))
+    (is (= (range 1 (inc n)) (map :e ds)))
+    (is (= (range n 0 -1) (map :e (rseq ds))))
+    (is (= (range n 0 -1) (map :e (reverse ds))))
+    (is (= [1 2 3] (map :e (take 3 ds))))
+    (is (= 1000 (:e (nth ds 999))))
+    (is (= (reduce + (range 1 (inc n))) (reduce (fn [acc d] (+ acc (:v d))) 0 ds)))
+    (is (= 10 (reduce (fn [acc d] (if (= 10 (:e d)) (reduced (:e d)) acc)) 0 ds)))
+    (is (= (range 2001 (inc n)) (map :e (d/seek-datoms db :eavt 2001))))
+    (is (= (range 1000 0 -1) (map :e (d/rseek-datoms db :eavt 1000))))
+    (is (= ds (seq ds)))
+    (is (= (vec ds) (into [] ds)))
+    (is (= n (count (into #{} ds))))
+    (testing "as JavaScript iterates"
+      (let [it (es6-iterator (d/seek-datoms db :eavt 2990))]
+        (is (= (range 2990 (inc n))
+              (loop [out []]
+                (let [step (.next it)]
+                  (if (.-done step) out (recur (conj out (.-e (.-value step)))))))))))
+    (testing "a datom's fields are JavaScript's properties"
+      (let [d (first ds)]
+        (is (= [1 :n 1] [(.-e d) (.-a d) (.-v d)]))
+        (is (= (inc d/tx0) (.-tx d)))))
+    (testing "a run that is read to its end, or let go of, holds nothing in the module"
+      (is (zero? (:cursors (wasm/held)))))))
+
+(deftest test-deep-values
+  (let [depth 20000
+        deep  (reduce (fn [acc _] [acc]) [:bottom] (range depth))
+        db    (d/db-with (d/empty-db) [[:db/add 1 :deep deep]])
+        back  (:v (first (d/datoms db :eavt 1 :deep)))]
+    (testing "a value nested deeper than the stack goes through and comes back"
+      (is (= :bottom (loop [x back] (if (vector? (first x)) (recur (first x)) (first x)))))
+      (is (= depth (loop [x back n 0] (if (vector? (first x)) (recur (first x) (inc n)) n)))))
+    (testing "what the stack has no room for ends as it does in ClojureScript, and leaves the module in order"
+      (dotimes [_ 20]
+        (is (thrown? js/RangeError (d/q '[:find ?s . :in ?x :where [(str ?x) ?s]] back))))
+      (is (= 1 (d/q '[:find ?e . :where [?e :deep]] db)))
+      (is (= "Ivan" (d/q '[:find ?n . :where [1 :name ?n]] people))))))
+
+(deftest test-databases-are-values
+  (let [db1 (d/db-with (d/empty-db) [[:db/add 1 :name "Ivan"]])
+        db2 (d/db-with (d/empty-db) [[:db/add 1 :name "Ivan"]])]
+    (is (= db1 db2))
+    (is (= (hash db1) (hash db2)))
+    (is (not (identical? db1 db2)))
+    (is (identical? db1 (d/q '[:find ?db . :in ?db] db1)))
+    (is (= {:a 1} (meta (with-meta db1 {:a 1}))))
+    (is (= db1 (with-meta db1 {:a 1})))
+    (is (= #{["Ivan"]} (d/q '[:find ?n :where [_ :name ?n]] (with-meta db1 {:a 1}))))
+    (is (= {db1 :found} {db2 :found}))
+    (is (= "#datascript/DB {:schema nil, :datoms [[1 :name \"Ivan\" 536870913]]}" (pr-str db1)))
+    (is (= db1 (cljs.reader/read-string (pr-str db1))))))
+
+(defn- settle
+  "Calls back once the garbage collector has run and what it frees has been let go of."
+  [rounds done]
+  (if (zero? rounds)
+    (done)
+    (do
+      (js/gc)
+      (js/setTimeout #(settle (dec rounds) done) 10))))
+
+(deftest test-databases-are-let-go-of
+  (if-not (exists? js/gc)
+    (println "  (handles: run node with --expose-gc to check that the module lets databases go)")
+    (async done
+      (settle 5
+        (fn []
+          (let [before (wasm/held)]
+            ;; databases, filtered databases with a function of the host's each, and half-read runs of datoms
+            (dotimes [i 500]
+              (let [db (d/db-with (d/empty-db) (for [j (range 100)] [:db/add (inc j) :n (+ i j)]))
+                    f  (d/filter db (fn [_ d] (odd? (:v d))))]
+                (first (d/datoms db :eavt))
+                (first (d/datoms f :eavt))))
+            (is (< (+ (:dbs before) 500) (:dbs (wasm/held))))
+            (settle 10
+              (fn []
+                (let [after (wasm/held)]
+                  (println "  handles before:" (pr-str before) "after:" (pr-str after))
+                  (is (<= (:dbs after) (+ (:dbs before) 4)))
+                  (is (<= (:host-fns after) (+ (:host-fns before) 2)))
+                  (is (<= (:cursors after) (:cursors before)))
+                  (done))))))))))

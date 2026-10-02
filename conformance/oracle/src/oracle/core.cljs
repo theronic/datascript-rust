@@ -16,8 +16,7 @@
     [datascript.core :as d]
     [datascript.db :as db]
     [datascript.impl.entity :as de]
-    [datascript.parser :as dp]
-    [datascript.pull-parser :as dpp]))
+    [oracle.internals :as internals]))
 
 (def fs (js/require "fs"))
 
@@ -357,18 +356,18 @@
          @conn])
 
       ;; --- the runtime underneath: ClojureScript's own hash, equality, order and printing
-      :cljs/hash    [(p (hash (arg :val))) nil]
-      :cljs/pr-str  [(p (p (arg :val))) nil]
-      :cljs/str     [(p (str (arg :val))) nil]
-      :cljs/eq      [(p (= (arg :a) (arg :b))) nil]
-      :cljs/compare [(p (let [c (db/value-compare (arg :a) (arg :b))] (cond (neg? c) -1 (pos? c) 1 :else 0))) nil]
+      :cljs/hash    [(p (internals/hash-of (arg :val))) nil]
+      :cljs/pr-str  [(p (binding [*print-namespace-maps* false] (internals/pr-str-of (arg :val)))) nil]
+      :cljs/str     [(p (internals/str-of (arg :val))) nil]
+      :cljs/eq      [(p (internals/equal? (arg :a) (arg :b))) nil]
+      :cljs/compare [(p (let [c (internals/value-compare (arg :a) (arg :b))] (cond (neg? c) -1 (pos? c) 1 :else 0))) nil]
       :cljs/set     [(p (set (arg :vals))) nil]
       :cljs/into-map [(p (into {} (arg :pairs))) nil]
       :cljs/assoc   [(p (apply assoc (arg :map) (arg :kvs))) nil]
       :cljs/dissoc  [(p (apply dissoc (arg :map) (arg :ks))) nil]
       :cljs/conj    [(p (apply conj (arg :coll) (arg :xs))) nil]
       :cljs/disj    [(p (apply disj (arg :coll) (arg :xs))) nil]
-      :cljs/sort    [(p (vec (sort db/value-compare (arg :vals)))) nil]
+      :cljs/sort    [(p (vec (sort internals/value-compare (arg :vals)))) nil]
       :cljs/read    [(p (reader/read-string (arg :string))) nil]
       :cljs/group-by-first [(p (group-by first (arg :vals))) nil]
       :cljs/distinct [(p (vec (distinct (arg :vals)))) nil]
@@ -378,8 +377,8 @@
       :cljs/select-keys [(p (select-keys (arg :map) (arg :ks))) nil]
 
       ;; --- the parsers, printed as their records print
-      :parse-query   [(p (dp/parse-query (arg :query))) nil]
-      :parse-pull    [(p (walk/postwalk #(if (fn? %) :fn %) (into {} (dpp/parse-pattern (arg :db) (arg :pattern))))) nil]
+      :parse-query   [(internals/parse-query-line (arg :query)) nil]
+      :parse-pull    [(internals/parse-pull-line (arg :db) (arg :pattern)) nil]
 
       (throw (js/Error. (str "oracle: unknown op " op))))))
 

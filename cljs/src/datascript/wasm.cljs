@@ -41,6 +41,7 @@
 (def ^:const t-host-obj 22)
 (def ^:const t-module-fn 23)
 (def ^:const t-db-info 24)
+(def ^:const t-type 25)
 
 (def ^:const op-empty-db 1)
 (def ^:const op-init-db 2)
@@ -78,6 +79,9 @@
 (def ^:const op-hash 34)
 (def ^:const op-set-option 35)
 (def ^:const op-index-counts 36)
+(def ^:const op-compare 37)
+(def ^:const op-equiv 38)
+(def ^:const op-str 39)
 
 ;; ---------------------------------------------------------------- what datascript.db fills in
 
@@ -143,9 +147,45 @@
           (aset table handle nil)
           (.push (.-free hs) handle))))))
 
+;; ---------------------------------------------------------------- types
+
+;; What `type` answers is a constructor here and a name in the module: the two, by each other.
+(def ^:private type-by-name (js/Map.))
+(def ^:private name-by-type (js/Map.))
+
+(defn register-type!
+  "Makes a type known to the module, by a name: the one given, which is the module's own for a type it
+  has values of, or the one type->str gives, which is what DataScript orders values of different
+  types by."
+  ([ctor]
+   (or (.get name-by-type ctor)
+     (let [name (type->str ctor)]
+       ;; optimized builds leave two types of one shape with one name
+       (register-type! ctor (if (.has type-by-name name) (str name "#" (.-size type-by-name)) name)))))
+  ([ctor name]
+   (.set type-by-name name ctor)
+   (.set name-by-type ctor name)
+   name))
+
+;; JavaScript's own, as the module names them, and ClojureScript's by their names
+(doseq [[name ctor] [["Number" js/Number] ["String" js/String] ["Boolean" js/Boolean] ["Date" js/Date]
+                     ["RegExp" (type #"")] ["Function" js/Function] ["Object" js/Object]
+                     ["Array" js/Array] ["Error" js/Error]]]
+  (register-type! ctor (str "function " name "() { [native code] }")))
+
+(doseq [[name ctor] [["Keyword" Keyword] ["Symbol" Symbol] ["PersistentVector" PersistentVector]
+                     ["List" List] ["EmptyList" EmptyList] ["PersistentArrayMap" PersistentArrayMap]
+                     ["PersistentHashMap" PersistentHashMap] ["PersistentHashSet" PersistentHashSet]
+                     ["UUID" UUID] ["LazySeq" LazySeq] ["Cons" Cons] ["Subvec" Subvec]
+                     ["MapEntry" MapEntry] ["PersistentTreeMap" PersistentTreeMap]
+                     ["PersistentTreeSet" PersistentTreeSet] ["PersistentQueue" PersistentQueue]
+                     ["Range" Range] ["IntegerRange" IntegerRange] ["Atom" Atom]
+                     ["ExceptionInfo" ExceptionInfo]]]
+  (register-type! ctor (str "cljs.core/" name)))
+
 ;; ---------------------------------------------------------------- writing
 
-(deftype Enc [^:mutable buf ^:mutable dv ^:mutable pos ^:mutable kws ^:mutable syms])
+(deftype Enc [^:mutable buf ^:mutable dv ^:mutable pos ^:mutable kws ^:mutable syms ^:mutable depth])
 
 (def ^:private enc-pool (array))
 (def ^:private enc-depth 0)
@@ -157,13 +197,14 @@
   (let [depth enc-depth
         e     (or (aget enc-pool depth)
                 (let [buf (js/Uint8Array. 4096)
-                      e   (Enc. buf (js/DataView. (.-buffer buf)) 0 nil nil)]
+                      e   (Enc. buf (js/DataView. (.-buffer buf)) 0 nil nil 0)]
                   (aset enc-pool depth e)
                   e))]
     (set! enc-depth (inc depth))
     (set! (.-pos e) 0)
     (set! (.-kws e) nil)
     (set! (.-syms e) nil)
+    (set! (.-depth e) 0)
     e))
 
 (defn- enc-close []
@@ -263,39 +304,104 @@
   (w-varint e (mention! host-objs x))
   (w-zigzag e (try (hash x) (catch :default _ 0))))
 
+(defn- whole-int32? [n]
+  (and (number? n) (== (bit-or n 0) n)))
+
+(defn- ^boolean datom-ids?
+  "Whether a datom's ids are ones the module has datoms for."
+  [d]
+  (and (whole-int32? (.-e d)) (whole-int32? (.-tx d))))
+
+(defn- w-datom-head [^Enc e d]
+  (w-byte e t-datom)
+  (w-zigzag e (.-e d))
+  (w-value e (.-a d)))
+
+(defn- w-datom-end [^Enc e d]
+  (let [tx (.-tx d)]
+    (w-zigzag e (if (neg? tx) (- tx) tx))
+    (w-byte e (if (pos? tx) 1 0))))
+
+(defn- datom-as-vector
+  "A datom with ids the module has no datom for, as the transaction form of it, which says what is
+  wrong with them."
+  [d]
+  (let [tx (.-tx d)]
+    #js [(if (pos? tx) :db/add :db/retract) (.-e d) (.-a d) (.-v d) (if (neg? tx) (- tx) tx)]))
+
+(defn- ^boolean w-flat
+  "Writes a value that holds no other, whole, and answers true. Of a collection, or a datom whose value
+  is one, writes nothing and answers false."
+  [^Enc e x]
+  (cond
+    (nil? x)     (do (w-byte e t-nil) true)
+    (number? x)  (do (w-number e x) true)
+    (string? x)  (do (w-byte e t-str) (w-str e x) true)
+    (keyword? x) (do (w-named e nil (.-fqn x) t-kw-def t-kw-ref) true)
+    (true? x)    (do (w-byte e t-true) true)
+    (false? x)   (do (w-byte e t-false) true)
+
+    (instance? PersistentVector x)   false
+    (instance? PersistentArrayMap x) false
+
+    (instance? datom-type x)
+    (let [v (.-v x)]
+      (if (or (not (datom-ids? x)) (coll? v) (array? v))
+        false
+        (do
+          (w-datom-head e x)
+          (w-value e v)
+          (w-datom-end e x)
+          true)))
+
+    (symbol? x)
+    (do (w-named e nil (.-str x) t-sym-def t-sym-ref) true)
+
+    (some? (db-handle x))
+    (do (w-byte e t-db) (w-varint e (db-handle x)) true)
+
+    (instance? PersistentHashMap x) false
+    (instance? PersistentHashSet x) false
+
+    ;; a record stays the value it is: the module asks the host what it needs to know of it
+    (record? x)
+    (do (w-host-obj e x) true)
+
+    (or (map? x) (set? x) (vector? x) (sequential? x) (array? x))
+    false
+
+    (uuid? x)
+    (do (w-byte e t-uuid) (w-str e (.-uuid x)) true)
+
+    (inst? x)
+    (do (w-byte e t-inst) (w-f64 e (.getTime x)) true)
+
+    (regexp? x)
+    (do (w-byte e t-regex) (w-str e (.-source x)) (w-str e (.-flags x)) true)
+
+    (some? (gobj/get x "datascript$moduleFn"))
+    (do (w-byte e t-module-fn) (w-varint e (gobj/get x "datascript$moduleFn")) (w-str e "") true)
+
+    (fn? x)
+    (do
+      (if-some [name (.get name-by-type x)]
+        (do (w-byte e t-type) (w-str e name))
+        (do (w-byte e t-host-fn) (w-varint e (mention! host-fns x))))
+      true)
+
+    :else
+    (do (w-host-obj e x) true)))
+
 (defn- w-array [^Enc e tag ^array arr]
   (w-byte e tag)
   (w-varint e (.-length arr))
   (dotimes [i (.-length arr)]
     (w-value e (aget arr i))))
 
-(defn- whole-int32? [n]
-  (and (number? n) (== (bit-or n 0) n)))
-
-(defn- w-datom [^Enc e d]
-  (let [ee (.-e d)
-        tx (.-tx d)]
-    (if (and (whole-int32? ee) (whole-int32? tx))
-      (do
-        (w-byte e t-datom)
-        (w-zigzag e ee)
-        (w-value e (.-a d))
-        (w-value e (.-v d))
-        (w-zigzag e (if (neg? tx) (- tx) tx))
-        (w-byte e (if (pos? tx) 1 0)))
-      ;; ids the module has no datom for: as the transaction form of it, which says what is wrong with them
-      (w-array e t-vector
-        #js [(if (pos? tx) :db/add :db/retract) ee (.-a d) (.-v d) (if (neg? tx) (- tx) tx)]))))
-
-(defn- w-value [^Enc e x]
+(defn- w-nested
+  "A collection, or a datom whose value is one: each value in it written by a call."
+  [^Enc e x]
   (cond
-    (nil? x)     (w-byte e t-nil)
-    (number? x)  (w-number e x)
-    (string? x)  (do (w-byte e t-str) (w-str e x))
-    (keyword? x) (w-named e nil (.-fqn x) t-kw-def t-kw-ref)
-    (true? x)    (w-byte e t-true)
-    (false? x)   (w-byte e t-false)
-
     (instance? PersistentVector x)
     (let [n (count x)]
       (w-byte e t-vector)
@@ -312,13 +418,12 @@
         (w-value e (aget arr i))))
 
     (instance? datom-type x)
-    (w-datom e x)
-
-    (symbol? x)
-    (w-named e nil (.-str x) t-sym-def t-sym-ref)
-
-    (some? (db-handle x))
-    (do (w-byte e t-db) (w-varint e (db-handle x)))
+    (if (datom-ids? x)
+      (do
+        (w-datom-head e x)
+        (w-value e (.-v x))
+        (w-datom-end e x))
+      (w-array e t-vector (datom-as-vector x)))
 
     (instance? PersistentHashMap x)
     (do
@@ -332,7 +437,7 @@
       (w-varint e (count x))
       (reduce (fn [_ v] (w-value e v) nil) nil x))
 
-    ;; a record is the map of its fields, a sorted map the map of its entries in their order
+    ;; a sorted map is the map of its entries in their order
     (map? x)
     (let [entries (to-array (seq x))]
       (w-byte e t-array-map)
@@ -353,26 +458,86 @@
     (sequential? x)
     (w-array e t-list (to-array x))
 
-    (array? x)
-    (w-array e t-vector x)
-
-    (uuid? x)
-    (do (w-byte e t-uuid) (w-str e (.-uuid x)))
-
-    (inst? x)
-    (do (w-byte e t-inst) (w-f64 e (.getTime x)))
-
-    (regexp? x)
-    (do (w-byte e t-regex) (w-str e (.-source x)) (w-str e (.-flags x)))
-
-    (some? (gobj/get x "datascript$moduleFn"))
-    (do (w-byte e t-module-fn) (w-varint e (gobj/get x "datascript$moduleFn")) (w-str e ""))
-
-    (fn? x)
-    (do (w-byte e t-host-fn) (w-varint e (mention! host-fns x)))
-
     :else
-    (w-host-obj e x)))
+    (w-array e t-vector x)))
+
+(defn- begin
+  "Writes what a collection begins with, and answers its elements in the order they follow."
+  [^Enc e x]
+  (let [elements
+        (cond
+          (instance? PersistentVector x)   (do (w-byte e t-vector) (to-array x))
+          (instance? PersistentArrayMap x) (do (w-byte e t-array-map) (.-arr x))
+          (instance? datom-type x)         (do (w-byte e t-vector) (datom-as-vector x))
+          (instance? PersistentHashMap x)  (let [kvs (array)]
+                                             (w-byte e t-hash-map)
+                                             (reduce-kv (fn [_ k v] (.push kvs k v) nil) nil x)
+                                             kvs)
+          (instance? PersistentHashSet x)  (do
+                                             (w-byte e (if (instance? PersistentArrayMap (.-hash-map x)) t-array-set t-hash-set))
+                                             (to-array x))
+          (map? x)                         (let [kvs (array)]
+                                             (w-byte e t-array-map)
+                                             (doseq [entry (seq x)]
+                                               (.push kvs (key entry) (val entry)))
+                                             kvs)
+          (set? x)                         (do (w-byte e t-array-set) (to-array x))
+          (vector? x)                      (do (w-byte e t-vector) (to-array x))
+          (sequential? x)                  (do (w-byte e t-list) (to-array x))
+          :else                            (do (w-byte e t-vector) x))]
+    (w-varint e (if (map? x) (/ (.-length elements) 2) (.-length elements)))
+    elements))
+
+(defn- w-deep
+  "A collection, or a datom whose value is one, written from a list of the collections it is in the
+  middle of and not by a call for each: for values nested deeper than the stack has room for."
+  [^Enc e x]
+  ;; the elements still to write, how many of them are written, and the datom to end when they are
+  (let [todo  (array)
+        at    (array)
+        ends  (array)
+        open! (fn [x]
+                (when-not (w-flat e x)
+                  (if (and (instance? datom-type x) (datom-ids? x))
+                    (do
+                      (w-datom-head e x)
+                      (.push todo #js [(.-v x)])
+                      (.push ends x))
+                    (do
+                      (.push todo (begin e x))
+                      (.push ends nil)))
+                  (.push at 0)))]
+    (open! x)
+    (loop []
+      (let [top (dec (.-length todo))]
+        (when-not (neg? top)
+          (let [elements (aget todo top)
+                i        (aget at top)]
+            (if (< i (.-length elements))
+              (do
+                (aset at top (inc i))
+                (open! (aget elements i)))
+              (do
+                (when-some [d (aget ends top)]
+                  (w-datom-end e d))
+                (.pop todo)
+                (.pop at)
+                (.pop ends))))
+          (recur))))))
+
+(def ^:const ^:private max-depth
+  "How deep values are written and read by calls."
+  128)
+
+(defn- w-value [^Enc e x]
+  (when-not (w-flat e x)
+    (let [depth (.-depth e)]
+      (if (< depth max-depth)
+        (do
+          (set! (.-depth e) (inc depth))
+          (w-nested e x)
+          (set! (.-depth e) depth))
+        (w-deep e x)))))
 
 (defn- written
   "What a writer holds, in the module's memory: [ptr len]."
@@ -454,12 +619,17 @@
 
 (declare r-value call)
 
+(def ^:private module-fns (js/Map.))
+
 (defn- module-fn
-  "A function of the module's, as one of the host's: calling it calls the module."
+  "A function of the module's, as one of the host's: calling it calls the module. The module's
+  functions are the ones it is built with, and each is one function here."
   [handle]
-  (let [f (fn self [& args] (call op-call-fn #js [self (vec args)]))]
-    (gobj/set f "datascript$moduleFn" handle)
-    f))
+  (or (.get module-fns handle)
+    (let [f (fn self [& args] (call op-call-fn #js [self (vec args)]))]
+      (gobj/set f "datascript$moduleFn" handle)
+      (.set module-fns handle f)
+      f)))
 
 ;; The collections, of their elements in an array
 
@@ -538,6 +708,9 @@
              max-tx   (r-zigzag d)
              filtered (r-byte d)]
          (db-ctor handle uid max-eid max-tx (== filtered 1)))
+    25 (let [name (r-str d)]
+         (or (.get type-by-name name)
+           (throw (js/Error. (str "datascript: a type the host has no constructor for: " name)))))
     (throw (js/Error. (str "datascript: a value of no known kind (" tag ")")))))
 
 (defn- ^boolean nested-tag?
@@ -623,10 +796,6 @@
                 (aset around 2 (inc (aget around 2)))
                 (recur)))))))))
 
-(def ^:const ^:private max-depth
-  "How deep values are read by calls."
-  128)
-
 (defn- r-value [^Dec d]
   (let [tag (r-byte d)]
     (if (nested-tag? tag)
@@ -648,6 +817,27 @@
 
 ;; ---------------------------------------------------------------- calling
 
+;; The module lets go of a function or a value of the host's as soon as it has no use for it, which may
+;; be before the host has read the answer that names it: what is let go of during a call waits until
+;; the call has been read.
+(def ^:private calls 0)
+(def ^:private let-go (array))
+
+(defn- host-release [kind handle]
+  (if (pos? calls)
+    (.push let-go kind handle)
+    (release! (if (== kind 0) host-fns host-objs) handle)))
+
+(defn- call-ended! []
+  (set! calls (dec calls))
+  (when (and (zero? calls) (pos? (.-length let-go)))
+    (let [pending let-go]
+      (set! let-go (array))
+      (loop [i 0]
+        (when (< i (.-length pending))
+          (release! (if (== (aget pending i) 0) host-fns host-objs) (aget pending (inc i)))
+          (recur (+ i 2)))))))
+
 (defn- write-args [^array args]
   (let [e (enc-open)]
     (try
@@ -661,26 +851,30 @@
   [op ^array args]
   (when (nil? ds-call)
     (throw (js/Error. "DataScript's WebAssembly module is not loaded: datascript.wasm/instantiate first")))
-  (let [at     (write-args args)
-        top    (.-value stack-pointer)
-        status (try
-                 (ds-call op (aget at 0) (aget at 1))
-                 (catch :default e
-                   ;; The call did not return: the stack ran out under it, or the module gave up. Its own
-                   ;; stack is put back where it was, and what it was in the middle of is let go of.
-                   (set! (.-value stack-pointer) top)
-                   (ds-recover)
-                   (throw e)))
-        v      (read-at (unsigned-bit-shift-right (ds-result-ptr) 0) (ds-result-len))]
-    (if (== status 0)
-      v
-      ;; [message data exception]: what a function of the host's threw is thrown on as it was
-      (let [exception (nth v 2)]
-        (throw
-          (cond
-            (some? exception) exception
-            (some? (nth v 1)) (ex-info (nth v 0) (nth v 1))
-            :else             (js/Error. (nth v 0))))))))
+  (set! calls (inc calls))
+  (try
+    (let [at     (write-args args)
+          top    (.-value stack-pointer)
+          status (try
+                   (ds-call op (aget at 0) (aget at 1))
+                   (catch :default e
+                     ;; The call did not return: the stack ran out under it, or the module gave up. Its
+                     ;; own stack is put back where it was, and what it was in the middle of is let go of.
+                     (set! (.-value stack-pointer) top)
+                     (ds-recover)
+                     (throw e)))
+          v      (read-at (unsigned-bit-shift-right (ds-result-ptr) 0) (ds-result-len))]
+      (if (== status 0)
+        v
+        ;; [message data exception]: what a function of the host's threw is thrown on as it was
+        (let [exception (nth v 2)]
+          (throw
+            (cond
+              (some? exception) exception
+              (some? (nth v 1)) (ex-info (nth v 0) (nth v 1))
+              :else             (js/Error. (nth v 0)))))))
+    (finally
+      (call-ended!))))
 
 ;; ---------------------------------------------------------------- being called
 
@@ -710,7 +904,17 @@
   whoever called the module to be thrown it."
   [handle ptr len]
   (let [args (read-at (unsigned-bit-shift-right ptr 0) len)
-        f    (if (== handle -1) regex-exec (aget (.-table host-fns) handle))]
+        f    (if (neg? handle)
+               (case handle
+                 -1 regex-exec
+                 ;; what the module asks of a value it does not look into
+                 -2 (fn [x k not-found] (get x k not-found))
+                 -3 count
+                 -4 seq
+                 -5 contains?
+                 -6 apply
+                 -7 (fn [x] (when (map? x) (into {} x))))
+               (aget (.-table host-fns) handle))]
     (try
       (let [result (apply f args)
             e      (enc-open)]
@@ -747,16 +951,15 @@
     (case op
       0 (if (= x (aget table b)) 1 0)
       1 (do (reply-string! (pr-str x)) 0)
-      2 (do (reply-string! (type->str (type x))) 0)
+      ;; its type is known by that name from here on
+      2 (do (reply-string! (if (nil? x) "nil" (register-type! (type x)))) 0)
       3 (try
           (let [c (compare x (aget table b))]
             (cond (neg? c) 0 (zero? c) 1 :else 2))
           (catch :default _ 3))
       4 (do (reply-string! (str x)) 0)
+      5 (if (and (not (string? x)) (or (seqable? x) (array? x))) 1 0)
       0)))
-
-(defn- host-release [kind handle]
-  (release! (if (== kind 0) host-fns host-objs) handle))
 
 (defn- host-log [level ptr len]
   (let [text (.decode text-decoder (js/Uint8Array. (.-buffer memory) (unsigned-bit-shift-right ptr 0) len))]

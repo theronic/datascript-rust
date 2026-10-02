@@ -354,6 +354,12 @@ fn js_method_string<'a>(args: &'a [Value], method: &str) -> Result<&'a str> {
 
 fn count(args: &[Value]) -> Result<Value> {
     let v = arg(args, 0);
+    if let Value::Host(h) = v {
+        // what the value itself answers, its own complaint included
+        if let Some(n) = clj::host_count(h) {
+            return Ok(Value::from(n?));
+        }
+    }
     match v.count() {
         Some(n) => Ok(Value::from(n)),
         None => Err(Error::msg(clj::no_count(v))),
@@ -432,27 +438,41 @@ fn namespace(args: &[Value]) -> Result<Value> {
     }
 }
 
-/// `(type x)`: the same function for every value of a type.
-fn type_of(args: &[Value]) -> Result<Value> {
-    static TYPES: OnceLock<std::sync::Mutex<HashMap<String, Value>>> = OnceLock::new();
-    let v = arg(args, 0);
-    if v.is_nil() {
-        return Ok(Value::Nil);
-    }
-    let name = v.type_name().into_owned();
-    let mut types = TYPES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    Ok(types
-        .entry(name.clone())
+/// The types `type` has answered, by name (`Value::type_name`).
+fn types() -> std::sync::MutexGuard<'static, HashMap<String, Func>> {
+    static TYPES: OnceLock<std::sync::Mutex<HashMap<String, Func>>> = OnceLock::new();
+    TYPES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The type of that name: the same function for every value of the type. A host that has the type itself, a
+/// constructor, sends and is sent the name (`type_name_of`).
+pub fn type_named(name: &str) -> Func {
+    types()
+        .entry(name.to_string())
         .or_insert_with(|| {
             let not_called = |_: &[Value]| Err(Error::msg("a type is not called"));
             match name.strip_prefix("function ").and_then(|n| n.split('(').next()) {
                 // JavaScript's own: #object[Number]
-                Some(js) => Value::Fn(Func::new(js, not_called)),
+                Some(js) => Func::new(js, not_called),
                 // ClojureScript's prints as its name: cljs.core/Keyword
-                None => Value::Fn(Func::constructor(&name, not_called)),
+                None => Func::constructor(name, not_called),
             }
         })
-        .clone())
+        .clone()
+}
+
+/// The name of the type a function is, when it is one of those `type` answers.
+pub fn type_name_of(f: &Func) -> Option<String> {
+    types().iter().find(|(_, t)| t.id() == f.id()).map(|(name, _)| name.clone())
+}
+
+/// `(type x)`
+fn type_of(args: &[Value]) -> Result<Value> {
+    let v = arg(args, 0);
+    if v.is_nil() {
+        return Ok(Value::Nil);
+    }
+    Ok(Value::Fn(type_named(&v.type_name())))
 }
 
 fn hash_map(args: &[Value]) -> Result<Value> {
@@ -559,15 +579,17 @@ pub fn call(f: &Value, args: &[Value]) -> Result<Value> {
     let get_or = |coll: &Value, k: &Value| clj::get(coll, k).unwrap_or_else(|| arg(args, 1).clone());
     match f {
         Value::Fn(f) => f.call(args),
-        Value::Keyword(_) | Value::Symbol(_) => Ok(get_or(arg(args, 0), f)),
+        Value::Keyword(_) | Value::Symbol(_) => match arg(args, 0) {
+            Value::Host(h) => clj::host_get(h, f, arg(args, 1)),
+            coll => Ok(get_or(coll, f)),
+        },
         Value::Map(_) | Value::Set(_) => Ok(clj::get(f, arg(args, 0)).unwrap_or_else(|| arg(args, 1).clone())),
         Value::Vector(items) => match arg(args, 0).as_num().filter(|i| i.fract() == 0.0 && *i >= 0.0) {
             Some(i) if (i as usize) < items.len() => Ok(items[i as usize].clone()),
             _ => Err(Error::msg(format!("No item {} in vector of length {}", str_of(arg(args, 0)), items.len()))),
         },
-        Value::Host(_) => match crate::entity::Entity::from_value(f) {
-            // an entity looks the attribute up in itself
-            Some(e) => Ok(e.lookup_entry(arg(args, 0))?.unwrap_or_else(|| arg(args, 1).clone())),
+        Value::Host(h) => match clj::host_invoke(h, args) {
+            Some(answer) => answer,
             None => Err(Error::msg(message!(f, " is not a function"))),
         },
         other => Err(Error::msg(message!(other, " is not a function"))),
@@ -688,7 +710,10 @@ pub fn query_fn(sym: &Symbol) -> Option<Value> {
                 };
                 Ok(Value::from(substring(s, js_number(arg(a, 1)), a.get(2).map(js_number))))
             }),
-            ("get", |a| Ok(clj::get(arg(a, 0), arg(a, 1)).unwrap_or_else(|| arg(a, 2).clone()))),
+            ("get", |a| match arg(a, 0) {
+                Value::Host(h) => clj::host_get(h, arg(a, 1), arg(a, 2)),
+                coll => Ok(clj::get(coll, arg(a, 1)).unwrap_or_else(|| arg(a, 2).clone())),
+            }),
             ("pr-str", |a| Ok(Value::from(pr_str_all(a)))),
             ("print-str", |a| Ok(Value::from(print_str_all(a)))),
             ("println-str", |a| Ok(Value::from(print_str_all(a) + "\n"))),

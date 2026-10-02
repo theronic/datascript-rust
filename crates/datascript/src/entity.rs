@@ -84,12 +84,17 @@ impl Entity {
     /// The entity a value is, if it is one.
     pub fn from_value(v: &Value) -> Option<Entity> {
         match v {
-            Value::Host(h) => {
-                let any: Arc<dyn Any + Send + Sync> = h.0.clone().as_arc_any()?;
-                any.downcast::<Inner>().ok().map(Entity)
-            }
+            Value::Host(h) => Entity::from_host(h),
             _ => None,
         }
+    }
+
+    pub(crate) fn from_host(h: &HostObj) -> Option<Entity> {
+        if !h.0.as_any().is::<Inner>() {
+            return None;
+        }
+        let any: Arc<dyn Any + Send + Sync> = h.0.clone().as_arc_any()?;
+        any.downcast::<Inner>().ok().map(Entity)
     }
 
     /// `lookup-entity`: an attribute's value. A reference is an entity, an attribute of cardinality many a set, a

@@ -33,6 +33,7 @@ web/target-cljs
 # The Rust port: cargo's build folder, and the conformance oracle's compiled ClojureScript
 /target/
 /conformance/oracle/target/
+/conformance/wasm/target/
 /conformance/out/
 /cljs/target/
 /js/dist/

@@ -28,9 +28,25 @@ pub const OP_TYPE_NAME: u32 = 2;
 pub const OP_COMPARE: u32 = 3;
 /// the value as ClojureScript's `str` makes a string of it, in the reply
 pub const OP_STR: u32 = 4;
+/// whether the value is one ClojureScript makes a sequence of (1) or not (0)
+pub const OP_SEQABLE: u32 = 5;
 
-/// The handle the host's regular expressions answer to, when the host matches them (`ds_set_option`).
+/// The handle the host's regular expressions answer to, when the host matches them (`ds_set_option`):
+/// `[source flags input]` → `nil`, or `[index whole group ...]`.
 pub const REGEX_FN: u32 = u32::MAX;
+/// What the module asks of a value of the host's that it does not look into itself, as functions of the host's
+/// with handles of their own: `[x k not-found]` → `(get x k not-found)`
+pub const GET_FN: u32 = u32::MAX - 1;
+/// `[x]` → `(count x)`
+pub const COUNT_FN: u32 = u32::MAX - 2;
+/// `[x]` → `(seq x)`
+pub const SEQ_FN: u32 = u32::MAX - 3;
+/// `[x k]` → `(contains? x k)`
+pub const CONTAINS_FN: u32 = u32::MAX - 4;
+/// `[x args]` → `(apply x args)`
+pub const APPLY_FN: u32 = u32::MAX - 5;
+/// `[x]` → the map `x` is, when it is a map of a kind the module has no form for (a record); `nil` otherwise
+pub const AS_MAP_FN: u32 = u32::MAX - 6;
 
 #[cfg(target_arch = "wasm32")]
 mod imports {
@@ -165,6 +181,11 @@ pub fn call(handle: u32, args: &[Value]) -> Result<Value> {
     for a in args {
         w.value(a);
     }
+    call_written(handle, w)
+}
+
+/// A call whose arguments are written.
+fn call_written(handle: u32, w: Writer) -> Result<Value> {
     let status = raw_call(handle, &w.buf);
     let reply = take_reply().ok_or_else(|| Error::msg("datascript: the host answered a call with nothing"))?;
     if status == 0 {
@@ -211,9 +232,52 @@ fn op_string(op: u32, handle: u32, otherwise: &str) -> String {
     take_reply().and_then(|bytes| String::from_utf8(bytes).ok()).unwrap_or_else(|| otherwise.to_string())
 }
 
+impl ExternRef {
+    /// Asks the host of this value: one of its functions, with the value and then `args`.
+    fn ask(&self, function: u32, args: &[&Value]) -> Result<Value> {
+        let mut w = Writer::new();
+        w.count(VECTOR, 1 + args.len());
+        w.byte(crate::codec::HOST_OBJ);
+        w.varint(self.handle as u64);
+        w.zigzag(self.hash as i64);
+        for a in args {
+            w.value(a);
+        }
+        call_written(function, w)
+    }
+}
+
 impl HostObject for ExternRef {
     fn hash(&self) -> i32 {
         self.hash
+    }
+
+    fn lookup(&self, k: &Value, not_found: &Value) -> Option<Result<Value>> {
+        Some(self.ask(GET_FN, &[k, not_found]))
+    }
+
+    fn count(&self) -> Option<Result<usize>> {
+        Some(self.ask(COUNT_FN, &[]).map(|n| n.as_num().unwrap_or(0.0) as usize))
+    }
+
+    fn seqable(&self) -> bool {
+        raw_op(OP_SEQABLE, self.handle, 0) == 1
+    }
+
+    fn seq(&self) -> Option<Result<Vec<Value>>> {
+        Some(self.ask(SEQ_FN, &[]).map(|items| items.as_seq().map(<[Value]>::to_vec).unwrap_or_default()))
+    }
+
+    fn contains(&self, k: &Value) -> Option<Result<bool>> {
+        Some(self.ask(CONTAINS_FN, &[k]).map(|found| found.truthy()))
+    }
+
+    fn invoke(&self, args: &[Value]) -> Option<Result<Value>> {
+        Some(self.ask(APPLY_FN, &[&Value::list(args.to_vec())]))
+    }
+
+    fn as_map(&self) -> Result<Option<Value>> {
+        Ok(Some(self.ask(AS_MAP_FN, &[])?).filter(|m| matches!(m, Value::Map(_))))
     }
 
     fn equiv(&self, other: &dyn HostObject) -> bool {

@@ -79,6 +79,12 @@ pub const HASH: u32 = 34;
 pub const SET_OPTION: u32 = 35;
 /// `[db]` → `[eavt-count aevt-count avet-count]`
 pub const INDEX_COUNTS: u32 = 36;
+/// `[a b]` → -1, 0 or 1: DataScript's `value-compare`, the order of values in its indexes
+pub const COMPARE: u32 = 37;
+/// `[a b]` → whether the two are equal, as ClojureScript's `=` has it
+pub const EQUIV: u32 = 38;
+/// `[value]` → as ClojureScript's `str` makes a string of it
+pub const STR: u32 = 39;
 
 static NIL: Value = Value::Nil;
 
@@ -98,7 +104,10 @@ fn index_arg(v: &Value) -> Result<Index> {
 }
 
 fn handle_arg(v: &Value) -> Result<u32> {
-    v.as_num().filter(|n| *n >= 0.0 && n.fract() == 0.0).map(|n| n as u32).ok_or_else(|| Error::msg("datascript: a handle is a number"))
+    v.as_num()
+        .filter(|n| *n >= 0.0 && n.fract() == 0.0)
+        .map(|n| n as u32)
+        .ok_or_else(|| Error::msg("datascript: a handle is a number"))
 }
 
 fn count_arg(v: &Value) -> usize {
@@ -168,7 +177,10 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
                 match item {
                     Value::Datom(d) => datoms.push((*d).clone()),
                     other => {
-                        let ty = built_ins::call(&built_ins::query_fn(&datascript::Symbol::parse("type")).expect("type"), &[other])?;
+                        let ty = built_ins::call(
+                            &built_ins::query_fn(&datascript::Symbol::parse("type")).expect("type"),
+                            &[other],
+                        )?;
                         return Err(Error::new(
                             format!("init-db expects list of Datoms, got {}", datascript::print::pr_str(&ty)),
                             Value::kw_map(&[("error", Value::kw("init-db"))]),
@@ -236,7 +248,9 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
             let attr = if open(a) {
                 None
             } else {
-                Some(value_attr(a).ok_or_else(|| Error::msg(format!("Cannot compare {} to an attribute", datascript::print::str_of(a))))?)
+                Some(value_attr(a).ok_or_else(|| {
+                    Error::msg(format!("Cannot compare {} to an attribute", datascript::print::str_of(a)))
+                })?)
             };
             let v = Some(arg(args, 3)).filter(|v| v.is_some());
             let found = db::search(&db, e, attr.as_ref(), v, tx);
@@ -260,7 +274,14 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
             Value::Bool(freed.is_some())
         }
         FIND_DATOM => {
-            let found = db::find_datom(&db_arg(args, 0)?, index_arg(arg(args, 1))?, arg(args, 2), arg(args, 3), arg(args, 4), arg(args, 5))?;
+            let found = db::find_datom(
+                &db_arg(args, 0)?,
+                index_arg(arg(args, 1))?,
+                arg(args, 2),
+                arg(args, 3),
+                arg(args, 4),
+                arg(args, 5),
+            )?;
             found.map_or(Value::Nil, |d| Value::Datom(Arc::new(d)))
         }
         ENTID => db_arg(args, 0)?.entid_value(arg(args, 1))?,
@@ -281,13 +302,18 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
         DB_EMPTY => Value::Db(db_arg(args, 0)?.empty_like()?),
         SERIALIZABLE => {
             let (freeze_fn, freeze_kw) = (freezer(arg(args, 1)), freezer(arg(args, 2)));
-            let json = serialize::serializable(&db_arg(args, 0)?, &serialize_options(&freeze_fn, &freeze_kw, &None, &None))?;
+            let json =
+                serialize::serializable(&db_arg(args, 0)?, &serialize_options(&freeze_fn, &freeze_kw, &None, &None))?;
             Value::from(json.to_json_string())
         }
         FROM_SERIALIZABLE => {
-            let text = arg(args, 0).as_str().ok_or_else(|| Error::msg("datascript: from-serializable takes JSON text"))?;
+            let text =
+                arg(args, 0).as_str().ok_or_else(|| Error::msg("datascript: from-serializable takes JSON text"))?;
             let (thaw_fn, thaw_kw) = (thawer(arg(args, 1)), thawer(arg(args, 2)));
-            let db = serialize::from_serializable(&Json::parse(text)?, &serialize_options(&None, &None, &thaw_fn, &thaw_kw))?;
+            let db = serialize::from_serializable(
+                &Json::parse(text)?,
+                &serialize_options(&None, &None, &thaw_fn, &thaw_kw),
+            )?;
             Value::Db(db)
         }
         DIFF => db::diff(&db_arg(args, 0)?, &db_arg(args, 1)?)?,
@@ -322,6 +348,15 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
             let db = db_arg(args, 0)?;
             vector![db.index(Index::Eavt).count()?, db.index(Index::Aevt).count()?, db.index(Index::Avet).count()?]
         }
+        COMPARE => Value::from(match (arg(args, 0), arg(args, 1)) {
+            // `nil` is below everything, as the indexes have it
+            (Value::Nil, Value::Nil) => 0,
+            (Value::Nil, _) => -1,
+            (_, Value::Nil) => 1,
+            (a, b) => datascript::cmp::value_compare(a, b) as i32,
+        }),
+        EQUIV => Value::Bool(arg(args, 0) == arg(args, 1)),
+        STR => Value::from(datascript::print::str_of(arg(args, 0))),
         other => return Err(Error::msg(format!("datascript: no operation {other}"))),
     })
 }
