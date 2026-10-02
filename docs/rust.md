@@ -203,35 +203,35 @@ collector says so.
 
 `cljs/bench.sh` compiles one program twice, against ClojureScript DataScript and against the module, with
 `:advanced`, and times it in Node. Microseconds a call, the lesser of three runs, on a database of 20,000 entities
-and 180,000 datoms, on a laptop that was busy with other work:
+and 180,000 datoms, on a laptop:
 
 | | ClojureScript | WebAssembly | ratio |
 |---|---:|---:|---:|
-| transact 20,000 entities, ms | 986 | 462 | 0.47 |
-| `(first (d/datoms db :eavt e :name))` | 1.19 | 1.98 | 1.66 |
-| `(vec (d/datoms db :eavt e))` | 1.46 | 3.00 | 2.06 |
-| `find-datom` | 1.02 | 1.45 | 1.43 |
-| `seek-datoms`, the first three | 1.86 | 4.58 | 2.46 |
-| `index-range`, ten datoms | 3.54 | 7.77 | 2.19 |
-| `entid` of a lookup ref | 4.10 | 1.44 | 0.35 |
-| an entity's attribute | 2.11 | 3.35 | 1.59 |
-| an entity, touched | 13.4 | 13.4 | 0.99 |
-| `pull`, two attributes | 3.41 | 2.88 | 0.84 |
-| `pull`, wildcard | 11.9 | 5.90 | 0.50 |
-| `q`, one entity's attribute | 46.7 | 6.44 | 0.14 |
-| `q`, a join of about 20 rows | 3383 | 1391 | 0.41 |
-| `q`, a predicate over 20,000 | 4943 | 818 | 0.17 |
-| `q`, with a function of the program's over 20,000 | 2449 | 2254 | 0.92 |
-| `with`, one datom | 12.6 | 11.5 | 0.91 |
-| `with`, an entity of five attributes | 41.3 | 17.4 | 0.42 |
-| `transact!`, one datom, with a listener | 5.99 | 3.45 | 0.58 |
-| all 180,000 datoms, counted | 4241 | 944 | 0.22 |
-| all 180,000 datoms, reduced over | 8911 | 21532 | 2.42 |
-| a filtered database's datoms of an entity | 3.09 | 6.50 | 2.10 |
+| transact 20,000 entities, ms | 806 | 337 | 0.42 |
+| `(first (d/datoms db :eavt e :name))` | 0.88 | 1.45 | 1.66 |
+| `(vec (d/datoms db :eavt e))` | 1.00 | 2.31 | 2.31 |
+| `find-datom` | 0.79 | 1.03 | 1.29 |
+| `seek-datoms`, the first three | 0.92 | 2.83 | 3.09 |
+| `index-range`, ten datoms | 2.73 | 8.40 | 3.08 |
+| `entid` of a lookup ref | 2.64 | 1.40 | 0.53 |
+| an entity's attribute | 1.60 | 2.78 | 1.74 |
+| an entity, touched | 8.15 | 10.4 | 1.27 |
+| `pull`, two attributes | 2.26 | 2.14 | 0.94 |
+| `pull`, wildcard | 8.60 | 5.07 | 0.59 |
+| `q`, one entity's attribute | 33.1 | 4.96 | 0.15 |
+| `q`, a join of about 20 rows | 2117 | 1113 | 0.53 |
+| `q`, a predicate over 20,000 | 3584 | 678 | 0.19 |
+| `q`, with a function of the program's over 20,000 | 1144 | 1815 | 1.59 |
+| `with`, one datom | 9.22 | 9.06 | 0.98 |
+| `with`, an entity of five attributes | 36.9 | 16.7 | 0.45 |
+| `transact!`, one datom, with a listener | 3.87 | 2.94 | 0.76 |
+| all 180,000 datoms, counted | 3402 | 585 | 0.17 |
+| all 180,000 datoms, reduced over | 4777 | 16764 | 3.51 |
+| a filtered database's datoms of an entity | 1.97 | 5.05 | 2.57 |
 
-What the module does inside, queries, pulls and transactions, is two to seven times faster. A read of a few datoms
-pays for the crossing, a microsecond or two, and reading every datom of a database into ClojureScript pays for making
-each one again there.
+What the module does inside, queries, pulls and transactions, is up to seven times faster. A read of a few datoms
+pays for the crossing, a microsecond or two; a function of the program's that a query calls for every row pays for it
+every row; and reading every datom of a database into ClojureScript pays for making each one again there.
 
 The module is 1.0 MB, 250 KB at brotli's best; built for size (`opt-level = "z"`), 0.85 MB and 215 KB. The
 ClojureScript interface adds less to a program than DataScript itself does.

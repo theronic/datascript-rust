@@ -935,16 +935,14 @@
 (defn- ds-call-with
   "Writes an operation's arguments and calls it: the status it answers."
   [op ^array args]
-  (let [e (enc-open)]
-    (try
-      (w-array e t-vector args)
-      (catch :default ex
-        (enc-close)
-        (throw ex)))
-    (let [len (.-pos e)
-          ptr (written e)]
-      (enc-close)
-      (ds-call op ptr len))))
+  (let [e   (enc-open)
+        ;; the writer is given back whatever writing comes to
+        ptr (try
+              (w-array e t-vector args)
+              (written e)
+              (finally
+                (enc-close)))]
+    (ds-call op ptr (.-pos e))))
 
 (defn call
   "An operation of the module's, with its arguments in an array: its value, or what it throws."
