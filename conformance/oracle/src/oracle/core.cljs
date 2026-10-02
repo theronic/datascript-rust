@@ -90,6 +90,15 @@
    'tx-entity    (fn [db m] [m])
    'tx-count     (fn [db e a] [[:db/add e a (count (d/datoms db :eavt))]])
    'tx-throw     (fn [db & _] (throw (ex-info "thrown by tx fn" {:error :host/thrown})))
+   'tx-inc-age   (fn [db name]
+                   (if-some [ent (d/entity db [:name name])]
+                     [{:db/id (:db/id ent) :age (inc (:age ent))}
+                      [:db/add (:db/id ent) :had-birthday true]]
+                     (throw (ex-info (str "No entity with name: " name) {}))))
+   'tx-oleg      (fn [db] [{:name "Oleg"}])
+   'tx-vera      (fn [db] [{:db/id -1 :name "Vera"}])
+   'tx-nested    (fn [db e] [[:db.fn/call (fn [db e] [[:db/add e :nested (count db)]]) e]])
+   'tx-q         (fn [db] (for [[e] (d/q '[:find ?e :where [?e :name]] db)] [:db/add e :seen true]))
    ;; filter predicates: (pred db datom)
    'f-even-e     (fn [_ datom] (even? (:e datom)))
    'f-not-name   (fn [_ datom] (not= :name (:a datom)))
@@ -301,9 +310,24 @@
             db (d/from-serializable (js/JSON.parse (js/JSON.stringify s)))]
         [(str (js/JSON.stringify s) " " (db-line db)) db])
 
+      :from-serializable
+      (let [db (d/from-serializable (js/JSON.parse (arg :json)))]
+        [(db-line db) db])
+
       :read-db
       (let [db (reader/read-string (arg :string))]
         [(db-line db) db])
+
+      :conn-quiet
+      ;; transactions through a connection, each answering ok or its error; then the database, unprinted
+      (let [conn  (if (contains? step :db) (d/conn-from-db (arg :db)) (d/create-conn (arg :schema)))
+            lines (mapv (fn [tx]
+                          (try
+                            (d/transact! conn (resolve-args env tx))
+                            "ok"
+                            (catch :default e (error-line-quiet e))))
+                    (:txs step))]
+        [(str "#conn " (p lines)) @conn])
 
       :conn
       ;; a connection's life: transactions in order, each listened to, then its database
@@ -377,16 +401,17 @@
 (defn -main [& args]
   (let [[in out] args
         lines (->> (str/split (.readFileSync fs in "utf8") #"\n")
-                (remove #(or (str/blank? %) (str/starts-with? % ";"))))
-        sb    (array)]
+                (remove #(or (str/blank? %) (str/starts-with? % ";"))))]
+    ;; a case at a time, so that what a case that never ends leaves behind tells which it was
+    (.writeFileSync fs out "")
     (doseq [[i line] (map-indexed vector lines)]
-      (.push sb (str "== " i))
-      (try
-        (doseq [l (run-case (read-case line))]
-          (.push sb l))
-        (catch :default e
-          (.push sb (str "#case-error " (p (str (or (ex-message e) e))))))))
-    (.push sb "")
-    (.writeFileSync fs out (.join sb "\n"))))
+      (let [sb (array (str "== " i))]
+        (try
+          (doseq [l (run-case (read-case line))]
+            (.push sb l))
+          (catch :default e
+            (.push sb (str "#case-error " (p (str (or (ex-message e) e)))))))
+        (.push sb "")
+        (.appendFileSync fs out (.join sb "\n"))))))
 
 (set! *main-cli-fn* -main)

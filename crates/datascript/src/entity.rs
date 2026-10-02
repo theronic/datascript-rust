@@ -13,6 +13,9 @@ use crate::value::{HostObj, HostObject, Value};
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
+/// How deep components are touched within components before the touch is given up as endless.
+const MAX_TOUCH_DEPTH: usize = 1000;
+
 #[derive(Clone)]
 pub struct Entity(Arc<Inner>);
 
@@ -120,6 +123,15 @@ impl Entity {
 
     /// `(touch e)`: every attribute read and kept, components touched in turn.
     pub fn touch(&self) -> Result<()> {
+        self.touch_at(0)
+    }
+
+    /// Components that lead back to the entity they came from are touched without end: each turn makes entities
+    /// anew, none of them touched yet. ClojureScript runs out of stack; so, at a depth it would not reach, does this.
+    fn touch_at(&self, depth: usize) -> Result<()> {
+        if depth > MAX_TOUCH_DEPTH {
+            return Err(Error::msg("Maximum call stack size exceeded"));
+        }
         if self.state().touched {
             return Ok(());
         }
@@ -146,14 +158,14 @@ impl Entity {
                     let mut set = CljSet::new();
                     for x in v.seq_items().unwrap_or_default() {
                         if let Some(e) = Entity::from_value(&x) {
-                            e.touch()?;
+                            e.touch_at(depth + 1)?;
                         }
                         set.insert(x);
                     }
                     Value::set(set)
                 } else {
                     if let Some(e) = Entity::from_value(v) {
-                        e.touch()?;
+                        e.touch_at(depth + 1)?;
                     }
                     v.clone()
                 }

@@ -26,6 +26,7 @@ pub mod query;
 pub mod record;
 pub mod regex;
 pub mod schema;
+pub mod serialize;
 pub mod sorted_set;
 pub mod transact;
 pub mod value;

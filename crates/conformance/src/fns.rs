@@ -147,6 +147,42 @@ fn make(name: &str) -> Option<Value> {
             Ok(vector![vector![Value::kw("db/add"), arg(a, 1), arg(a, 2), n]])
         }),
         "tx-throw" => f(name, |_| Err(thrown("thrown by tx fn"))),
+        "tx-inc-age" => f(name, |a| {
+            let who = arg(a, 1);
+            let Some(ent) = datascript::entity(&db_arg(a)?, &vector![Value::kw("name"), who.clone()])? else {
+                return Err(Error::new(
+                    format!("No entity with name: {}", datascript::print::str_of(&who)),
+                    Value::map(datascript::CljMap::new()),
+                ));
+            };
+            let age = ent.lookup(&Value::kw("age"))?.unwrap_or(Value::Nil);
+            let id = Value::from(ent.eid());
+            Ok(vector![
+                Value::kw_map(&[("db/id", id.clone()), ("age", call(&built_in("inc"), &[age])?)]),
+                vector![Value::kw("db/add"), id, Value::kw("had-birthday"), true]
+            ])
+        }),
+        "tx-oleg" => f(name, |_| Ok(vector![Value::kw_map(&[("name", Value::str("Oleg"))])])),
+        "tx-vera" => {
+            f(name, |_| Ok(vector![Value::kw_map(&[("db/id", Value::from(-1)), ("name", Value::str("Vera"))])]))
+        }
+        "tx-nested" => f(name, |a| {
+            let inner = Value::Fn(Func::new("nested", |a| {
+                let n = db_arg(a)?.count()?;
+                Ok(vector![vector![Value::kw("db/add"), arg(a, 1), Value::kw("nested"), n]])
+            }));
+            Ok(vector![vector![Value::kw("db.fn/call"), inner, arg(a, 1)]])
+        }),
+        "tx-q" => f(name, |a| {
+            let query = datascript::edn::read_string("[:find ?e :where [?e :name]]")?;
+            let found = datascript::q(&query, &[arg(a, 0)])?;
+            let mut out = Vec::new();
+            for tuple in clj::seq(&found)? {
+                let e = clj::seq(&tuple)?.into_iter().next().unwrap_or(Value::Nil);
+                out.push(vector![Value::kw("db/add"), e, Value::kw("seen"), true]);
+            }
+            Ok(Value::list(out))
+        }),
 
         // filter predicates: (pred db datom)
         "f-even-e" => f(name, |a| call(&built_in("even?"), &[field(&arg(a, 1), "e")])),

@@ -745,11 +745,11 @@ pub fn index_range<D: Searchable>(db: &D, attr: &Value, start: &Value, end: &Val
 
 /// `find-datom`: the first datom of an index with these leading components.
 pub fn find_datom(db: &Db, index: Index, c0: &Value, c1: &Value, c2: &Value, c3: &Value) -> Result<Option<Datom>> {
+    validate_indexed(db, index, c0, c1, c2, c3)?;
     if db.is_filtered() {
         // it reads the index itself, which a filtered database does not give
         return Err(Error::msg("-lookup is not supported on FilteredDB"));
     }
-    validate_indexed(db, index, c0, c1, c2, c3)?;
     let from = components_bound(db, index, c0, c1, c2, c3, E0, TX0)?;
     let to = components_bound(db, index, c0, c1, c2, c3, EMAX, TXMAX)?;
     bound_kind_error(db.core(), index, &from)?;
@@ -1105,6 +1105,58 @@ pub fn db_from_reader(form: &Value) -> Result<Db> {
         }
     }
     Db::init(datoms, schema)
+}
+
+/// `clojure.data/diff` of two databases: `[only-in-a only-in-b in-both]`, each a vector of datoms or `nil`. Datoms
+/// are the same when entity, attribute and value are. Equal databases answer `[nil nil a]`; a filtered database is
+/// no database to `diff`, and differs whole.
+pub fn diff(a: &Db, b: &Db) -> Result<Value> {
+    if a.equiv(b) {
+        return Ok(Value::vector(vec![Value::Nil, Value::Nil, Value::Db(a.clone())]));
+    }
+    if a.is_filtered() || b.is_filtered() {
+        return Ok(Value::vector(vec![Value::Db(a.clone()), Value::Db(b.clone()), Value::Nil]));
+    }
+    let (xs, ys) = (a.index(Index::Eavt).to_vec()?, b.index(Index::Eavt).to_vec()?);
+    let (mut only_a, mut only_b, mut both) = (Vec::new(), Vec::new(), Vec::new());
+    let datom = |d: &Datom| Value::Datom(Arc::new(d.clone()));
+    let (mut i, mut j) = (0, 0);
+    while i < xs.len() && j < ys.len() {
+        let (x, y) = (&xs[i], &ys[j]);
+        if x.e == y.e && x.a.is_keyword() && !y.a.is_keyword() {
+            // a keyword does not compare with a string: neither datom is in the other's order, and both move on
+            only_a.push(datom(x));
+            only_b.push(datom(y));
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let attrs = || match (x.a.is_keyword(), y.a.is_keyword()) {
+            // a string compares with a keyword as with the keyword's string
+            (false, true) => crate::named::compare_str(x.a.full(), &format!(":{}", y.a.full())),
+            _ => x.a.cmp(&y.a),
+        };
+        let c = x.e.cmp(&y.e).then_with(attrs).then_with(|| crate::cmp::value_compare(&x.v, &y.v));
+        match c {
+            Ordering::Equal => {
+                both.push(datom(x));
+                i += 1;
+                j += 1;
+            }
+            Ordering::Less => {
+                only_a.push(datom(x));
+                i += 1;
+            }
+            Ordering::Greater => {
+                only_b.push(datom(y));
+                j += 1;
+            }
+        }
+    }
+    only_a.extend(xs[i..].iter().map(datom));
+    only_b.extend(ys[j..].iter().map(datom));
+    let not_empty = |v: Vec<Value>| if v.is_empty() { Value::Nil } else { Value::vector(v) };
+    Ok(Value::vector(vec![not_empty(only_a), not_empty(only_b), not_empty(both)]))
 }
 
 /// An attribute as the value it was given as.

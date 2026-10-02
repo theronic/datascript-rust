@@ -542,6 +542,55 @@ fn explode(db: &DbCore, entity: &CljMap) -> Explode {
     Explode { eid, pairs: plain, next: 0 }
 }
 
+/// The next attribute of an exploded map that has values, as `[:db/add ...]`s at the front of the queue, and the
+/// rest of the map after them. The attributes passed on the way are validated, as the original's lazy sequence
+/// validates them when it is read.
+fn expand(mut ex: Explode, db: &DbCore, es: &mut VecDeque<Item>) -> Result<()> {
+    let kw = kw();
+    let mut ops = Vec::new();
+    while ex.next < ex.pairs.len() && ops.is_empty() {
+        let (a, vs) = ex.pairs[ex.next].clone();
+        ex.next += 1;
+        if a.is_kw(&kw.db_id) {
+            continue;
+        }
+        let context = || {
+            Value::map(
+                [(Value::Keyword(kw.db_id.clone()), ex.eid.clone()), (a.clone(), vs.clone())].into_iter().collect(),
+            )
+        };
+        validate_attr(&a, context)?;
+        let reverse = is_reverse_ref(&a)?;
+        let straight_a = if reverse { reverse_ref(&a)? } else { a.clone() };
+        let straight_ref = props_of(db, &straight_a).is_ref;
+        if reverse && !straight_ref {
+            let context = context();
+            raise!("Bad attribute ", a, ": reverse attribute name requires {:db/valueType :db.type/ref} in schema";
+                {"error" => Value::kw("transact/syntax"), "attribute" => a.clone(), "context" => context})
+        }
+        for v in maybe_wrap_multival(db, &a, &vs)? {
+            if straight_ref && v.is_map() {
+                // another entity, given as a nested map
+                let Value::Map(nested) = &v else { unreachable!() };
+                let mut nested = (**nested).clone();
+                nested.assoc(reverse_ref(&a)?, ex.eid.clone());
+                ops.push(Value::map(nested));
+            } else if reverse {
+                ops.push(vec4(&Value::Keyword(kw.db_add.clone()), v, &straight_a, ex.eid.clone()));
+            } else {
+                ops.push(vec4(&Value::Keyword(kw.db_add.clone()), ex.eid.clone(), &straight_a, v));
+            }
+        }
+    }
+    if ex.next < ex.pairs.len() {
+        es.push_front(Item::Explode(ex));
+    }
+    for op in ops.into_iter().rev() {
+        es.push_front(Item::Entity(op));
+    }
+    Ok(())
+}
+
 /// A place in the queue of entities.
 enum Item {
     Entity(Value),
@@ -709,57 +758,19 @@ fn run(mut report: Report, initial_es: &[Value], has_tuples: bool) -> Result<Out
                 }
                 continue;
             }
-            Item::Explode(mut ex) => {
-                // the next attribute's values, and the rest of the entity after them
-                let db = &report.db;
-                let mut ops = Vec::new();
-                while ex.next < ex.pairs.len() && ops.is_empty() {
-                    let (a, vs) = ex.pairs[ex.next].clone();
-                    ex.next += 1;
-                    if a.is_kw(&kw.db_id) {
-                        continue;
-                    }
-                    let context = || {
-                        Value::map(
-                            [(Value::Keyword(kw.db_id.clone()), ex.eid.clone()), (a.clone(), vs.clone())]
-                                .into_iter()
-                                .collect(),
-                        )
-                    };
-                    validate_attr(&a, context)?;
-                    let reverse = is_reverse_ref(&a)?;
-                    let straight_a = if reverse { reverse_ref(&a)? } else { a.clone() };
-                    let straight_ref = props_of(db, &straight_a).is_ref;
-                    if reverse && !straight_ref {
-                        let context = context();
-                        raise!("Bad attribute ", a, ": reverse attribute name requires {:db/valueType :db.type/ref} in schema";
-                            {"error" => Value::kw("transact/syntax"), "attribute" => a.clone(), "context" => context})
-                    }
-                    for v in maybe_wrap_multival(db, &a, &vs)? {
-                        if straight_ref && v.is_map() {
-                            // another entity, given as a nested map
-                            let Value::Map(nested) = &v else { unreachable!() };
-                            let mut nested = (**nested).clone();
-                            nested.assoc(reverse_ref(&a)?, ex.eid.clone());
-                            ops.push(Value::map(nested));
-                        } else if reverse {
-                            ops.push(vec4(&Value::Keyword(kw.db_add.clone()), v, &straight_a, ex.eid.clone()));
-                        } else {
-                            ops.push(vec4(&Value::Keyword(kw.db_add.clone()), ex.eid.clone(), &straight_a, v));
-                        }
-                    }
-                }
-                if ex.next < ex.pairs.len() {
-                    es.push_front(Item::Explode(ex));
-                }
-                for op in ops.into_iter().rev() {
-                    es.push_front(Item::Entity(op));
-                }
+            Item::Explode(ex) => {
+                expand(ex, &report.db, &mut es)?;
                 continue;
             }
             Item::Entity(v) => (v, false),
             Item::Internal(v) => (v, true),
         };
+        // The original takes an entity off a lazy sequence with `[entity & entities]`, which reads the entity after
+        // it too: what an exploded map has next is validated before the entity in hand is transacted.
+        while matches!(es.front(), Some(Item::Explode(_))) {
+            let Some(Item::Explode(ex)) = es.pop_front() else { unreachable!() };
+            expand(ex, &report.db, &mut es)?;
+        }
 
         match &entity {
             Value::Nil => continue,

@@ -7,7 +7,7 @@ use datascript::coll::CljMap;
 use datascript::datom::datom_from_reader;
 use datascript::print::{pr_str, str_of};
 use datascript::value::{Func, HostObj, HostObject};
-use datascript::{clj, edn, vector, Datom, Db, Entity, Error, Index, Result, Value};
+use datascript::{clj, edn, serialize, vector, Datom, Db, Entity, Error, Index, Result, Value};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -446,6 +446,29 @@ fn run_step(env: &Env, step: &Value) -> Result<(String, Value)> {
             let db = db_arg(&arg("db")?)?.empty_like()?;
             (db_line(&db)?, Value::Db(db))
         }
+        "diff" => {
+            let (a, b) = (arg("a")?, arg("b")?);
+            let v = match (&a, &b) {
+                (Value::Db(x), Value::Db(y)) => datascript::db::diff(x, y)?,
+                // clojure.data/diff of what is no database: equal, or different whole
+                _ if a == b => vector![Value::Nil, Value::Nil, a.clone()],
+                _ => vector![a.clone(), b.clone(), Value::Nil],
+            };
+            (p(&v), nothing)
+        }
+        "serializable" => {
+            let json = serialize::serializable(&db_arg(&arg("db")?)?, &serialize::Options::default())?;
+            let text = json.to_json_string();
+            let db = serialize::from_serializable(&serialize::Json::parse(&text)?, &serialize::Options::default())?;
+            (format!("{} {}", text, db_line(&db)?), Value::Db(db))
+        }
+        "from-serializable" => {
+            let text = arg("json")?;
+            let json =
+                serialize::Json::parse(text.as_str().ok_or_else(|| Error::msg("from-serializable takes JSON"))?)?;
+            let db = serialize::from_serializable(&json, &serialize::Options::default())?;
+            (db_line(&db)?, Value::Db(db))
+        }
         "read-db" => {
             let s = arg("string")?;
             let v = edn::read_string(s.as_str().ok_or_else(|| Error::msg("read-db takes a string"))?)?;
@@ -453,6 +476,23 @@ fn run_step(env: &Env, step: &Value) -> Result<(String, Value)> {
             (db_line(&db)?, Value::Db(db))
         }
 
+        "conn-quiet" => {
+            // transactions through a connection, each answering ok or its error; then the database, unprinted
+            let conn = if has("db") {
+                datascript::conn::Conn::from_db(db_arg(&arg("db")?)?)
+            } else {
+                datascript::conn::Conn::create(arg("schema")?)?
+            };
+            let mut lines = Vec::new();
+            for tx in seq_arg(&raw("txs"))? {
+                lines.push(Value::from(match resolve(env, &tx).and_then(|tx| conn.transact(&tx, Value::Nil)) {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) if e.data.is_nil() => "#error :native".into(),
+                    Err(e) => error_line(&e),
+                }));
+            }
+            (format!("#conn {}", p(&Value::vector(lines))), Value::Db(conn.db()))
+        }
         "conn" => {
             // a connection's life: transactions in order, each listened to, then its database
             let conn = if has("db") {
@@ -557,7 +597,11 @@ fn run_step(env: &Env, step: &Value) -> Result<(String, Value)> {
 fn run_case(steps: &Value) -> Vec<String> {
     let mut env: Env = HashMap::new();
     let mut out = Vec::new();
-    for step in steps.as_seq().unwrap_or(&[]) {
+    let trace = std::env::var_os("CONFORMANCE_TRACE").is_some();
+    for (j, step) in steps.as_seq().unwrap_or(&[]).iter().enumerate() {
+        if trace {
+            eprintln!("  step {j}");
+        }
         let (line, value) = match run_step(&env, step) {
             Ok(r) => r,
             Err(e) => (error_line(&e), Value::Nil),
@@ -573,7 +617,11 @@ fn run_case(steps: &Value) -> Vec<String> {
 pub fn run_file(input: &str) -> String {
     let mut out = String::new();
     let lines = input.lines().filter(|l| !l.trim().is_empty() && !l.starts_with(';'));
+    let trace = std::env::var_os("CONFORMANCE_TRACE").is_some();
     for (i, line) in lines.enumerate() {
+        if trace {
+            eprintln!("case {i}");
+        }
         out.push_str(&format!("== {i}\n"));
         match read_case(line) {
             Ok(case) => {

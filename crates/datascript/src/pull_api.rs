@@ -453,9 +453,35 @@ fn run(frame: Frame, opts: &ParsedOpts) -> Result<Vec<Frame>> {
 }
 
 /// The attribute a wildcard pulls a datom as: from the last hundred met under this schema, or parsed now.
+///
+/// An attribute named as a reverse reference is, `:_ref`, which `[:db/add e :_ref v]` stores as it is written, would
+/// be parsed as the reference backwards, which the datom is not of: the original then asks for it again without
+/// end. Here it is pulled as the plain attribute it is.
 fn wildcard_attr(db: &Db, d: &Datom) -> Result<Arc<PullAttr>> {
     let name = d.a_value();
-    db.schema().pull_attrs.get(&name, || parse_attr_name(db, &name).map(Arc::new))
+    db.schema().pull_attrs.get(&name, || {
+        let attr = match parse_attr_name(db, &name) {
+            Ok(attr) if attr.name == name => attr,
+            _ => {
+                let p = crate::db::props_of(db, &name);
+                PullAttr {
+                    as_: name.clone(),
+                    default: Value::Nil,
+                    limit: if p.many { Value::from(1000) } else { Value::Nil },
+                    name: name.clone(),
+                    pattern: None,
+                    recursion_limit: Value::Nil,
+                    recursive: false,
+                    reverse: false,
+                    xform: None,
+                    multival: p.many,
+                    is_ref: false,
+                    component: false,
+                }
+            }
+        };
+        Ok(Arc::new(attr))
+    })
 }
 
 /// `-merge`: a frame takes the result of the frame it started.

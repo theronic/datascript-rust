@@ -41,7 +41,25 @@ fn main() -> ExitCode {
 /// Whether the port's line answers as the oracle's does. An error ClojureScript raised without data is JavaScript's
 /// own, whose wording is the engine's: any error answers it.
 fn same(oracle: &str, rust: &str) -> bool {
-    oracle == rust || (oracle.starts_with("#error :native") && rust.starts_with("#error"))
+    oracle == rust
+        || (oracle.starts_with("#error :native") && rust.starts_with("#error"))
+        || (oracle.contains(AUTO_TEMPID) && unnumbered(oracle) == unnumbered(rust))
+}
+
+const AUTO_TEMPID: &str = "#datascript/AutoTempid [";
+
+/// A line with the numbers of its automatic tempids left out. They come from a counter that every transaction of
+/// the process draws from, and ClojureScript, numbering lazily, draws less often: the numbers tell nothing.
+fn unnumbered(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(AUTO_TEMPID) {
+        let after = at + AUTO_TEMPID.len();
+        out.push_str(&rest[..after]);
+        rest = rest[after..].trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    out.push_str(rest);
+    out
 }
 
 fn compare(oracle: &str, rust: &str, cases: Option<&str>) -> ExitCode {

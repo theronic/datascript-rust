@@ -664,40 +664,75 @@ fn lookup_pattern_db(context: &Context, db: &Db, pattern: &[Value]) -> Result<Re
     let resolved = resolve_pattern_lookup_refs(Some(&Value::Db(db.clone())), &substituted)?;
     let part =
         |i: usize| -> Option<&Value> { resolved.get(i).filter(|v| !(is_blank(v) || is_free_var(v) || v.is_nil())) };
+    let nothing = || Ok(Relation::new(pattern_attrs(pattern), Tuples::Datoms(Vec::new())));
     let datoms = {
-        let e = match part(0) {
-            None => None,
-            Some(Value::Num(n)) => match crate::datom::id_from_num(*n) {
-                Ok(e) => Some(e),
-                // no datom has such an entity
-                Err(_) => return Ok(Relation::new(pattern_attrs(pattern), Tuples::Datoms(Vec::new()))),
-            },
-            Some(other) if other.truthy() => {
-                return Err(Error::msg(message!("Cannot compare ", other, " to an entity id")));
-            }
-            Some(_) => None,
-        };
-        let a = match part(1) {
-            None => None,
-            Some(a) if !a.truthy() => None,
-            Some(a) => Some(
-                value_attr(a)
-                    .ok_or_else(|| Error::msg(format!("Cannot compare {} to an attribute", crate::print::str_of(a))))?,
-            ),
-        };
         let v = part(2);
+        // A transaction that is no number is the transaction of no datom. (Where entity, attribute and value are
+        // all given, the original's index does not come to compare it: there it is as if left open.)
         let tx = match part(3) {
-            None => None,
-            Some(Value::Num(n)) => match crate::datom::id_from_num(*n) {
-                Ok(tx) => Some(tx),
-                Err(_) => return Ok(Relation::new(pattern_attrs(pattern), Tuples::Datoms(Vec::new()))),
-            },
-            Some(other) if other.truthy() => {
-                return Err(Error::msg(message!("Cannot compare ", other, " to a transaction id")));
-            }
-            Some(_) => None,
+            None => Some(None),
+            Some(Value::Num(n)) => crate::datom::id_from_num(*n).ok().map(Some),
+            Some(other) if other.truthy() => None,
+            Some(_) => Some(None),
         };
-        search(db, e, a.as_ref(), v, tx).to_vec()?
+        let a_given = part(1).filter(|a| a.truthy());
+        match part(0) {
+            // An entity that is no number: JavaScript's subtraction makes it NaN, which the index can order
+            // against nothing, and the original's search answers every datom there is. What the pattern does not
+            // then narrow by the index, it filters: the value where no attribute is given, the transaction where
+            // attribute and value are not both given.
+            Some(other) if other.truthy() && !matches!(other, Value::Num(_) | Value::Bool(_) | Value::Inst(_)) => {
+                match (a_given, v) {
+                    (Some(_), Some(_)) => search(db, None, None, None, None).to_vec()?,
+                    (Some(_), None) => match tx {
+                        Some(tx) => search(db, None, None, None, tx).to_vec()?,
+                        None => return nothing(),
+                    },
+                    (None, v) => match tx {
+                        Some(tx) => search(db, None, None, v, tx).to_vec()?,
+                        None => return nothing(),
+                    },
+                }
+            }
+            e => {
+                let e = match e {
+                    None => None,
+                    Some(Value::Num(n)) => match crate::datom::id_from_num(*n) {
+                        Ok(e) => Some(e),
+                        // no datom has such an entity
+                        Err(_) => return nothing(),
+                    },
+                    // true is 1 to JavaScript's subtraction
+                    Some(Value::Bool(true)) => Some(1),
+                    // a date is its milliseconds, which are no entity's id
+                    Some(Value::Inst(_)) => return nothing(),
+                    Some(_) => None,
+                };
+                let a = match a_given {
+                    None => None,
+                    Some(a) => match value_attr(a) {
+                        Some(a) => Some(a),
+                        // What is no attribute cannot be compared with one, which is an error wherever the search
+                        // would compare them: among the datoms of the entity, or anywhere when the entity is open.
+                        None => {
+                            if search(db, e, None, None, None).is_empty()? {
+                                return nothing();
+                            }
+                            return Err(Error::msg(format!(
+                                "Cannot compare {} to an attribute",
+                                crate::print::str_of(a)
+                            )));
+                        }
+                    },
+                };
+                let tx = match tx {
+                    Some(tx) => tx,
+                    None if e.is_some() && a.is_some() && v.is_some() => None,
+                    None => return nothing(),
+                };
+                search(db, e, a.as_ref(), v, tx).to_vec()?
+            }
+        }
     };
     Ok(Relation::new(pattern_attrs(pattern), Tuples::Datoms(datoms)))
 }
