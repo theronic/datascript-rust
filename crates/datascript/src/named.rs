@@ -3,10 +3,11 @@
 //! as ClojureScript keeps its keywords, so a keyword is a pointer that is copied, and copying a datom counts nothing.
 
 use crate::hash;
+use crate::lock::{Lazy, Lock};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -34,16 +35,16 @@ struct Names {
     by_id: Vec<&'static Named>,
 }
 
-type Table = Mutex<Names>;
+type Table = Lock<Names>;
 
 fn table(kind: Kind) -> &'static Table {
-    static KEYWORDS: OnceLock<Table> = OnceLock::new();
-    static SYMBOLS: OnceLock<Table> = OnceLock::new();
-    static STRINGS: OnceLock<Table> = OnceLock::new();
+    static KEYWORDS: Lazy<Table> = Lazy::new();
+    static SYMBOLS: Lazy<Table> = Lazy::new();
+    static STRINGS: Lazy<Table> = Lazy::new();
     match kind {
-        Kind::Keyword => KEYWORDS.get_or_init(Default::default),
-        Kind::Symbol => SYMBOLS.get_or_init(Default::default),
-        Kind::Str => STRINGS.get_or_init(Default::default),
+        Kind::Keyword => KEYWORDS.get_or_init(|| Lock::new(Names::default())),
+        Kind::Symbol => SYMBOLS.get_or_init(|| Lock::new(Names::default())),
+        Kind::Str => STRINGS.get_or_init(|| Lock::new(Names::default())),
     }
 }
 
@@ -60,7 +61,7 @@ fn split(full: &str) -> (Option<&str>, &str) {
 }
 
 fn intern(kind: Kind, full: &str) -> &'static Named {
-    let mut t = table(kind).lock().unwrap_or_else(|e| e.into_inner());
+    let mut t = table(kind).lock();
     if let Some(n) = t.by_name.get(full) {
         return n;
     }
@@ -83,7 +84,7 @@ fn intern(kind: Kind, full: &str) -> &'static Named {
 }
 
 fn by_id(kind: Kind, id: u32) -> Option<&'static Named> {
-    table(kind).lock().unwrap_or_else(|e| e.into_inner()).by_id.get(id as usize).copied()
+    table(kind).lock().by_id.get(id as usize).copied()
 }
 
 fn intern_parts(kind: Kind, ns: Option<&str>, name: &str) -> &'static Named {

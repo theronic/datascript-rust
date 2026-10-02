@@ -73,7 +73,7 @@ impl Default for Writer {
 thread_local! {
     /// What writers wrote into, kept for the next: a call writes at least one message, and a query that asks the
     /// host of every row writes one a row.
-    static SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SPARE: datascript::lock::Slot<Vec<Vec<u8>>> = const { datascript::lock::Slot::new(Vec::new()) };
 }
 
 /// A buffer that held a message, for a writer to come. Large ones are let go.
@@ -84,7 +84,7 @@ pub fn recycle(mut buf: Vec<u8>) {
     buf.clear();
     // not kept as a thread ends, when there is nowhere to keep it
     let _ = SPARE.try_with(|spare| {
-        let mut spare = spare.borrow_mut();
+        let mut spare = spare.get();
         if spare.len() < 8 {
             spare.push(buf);
         }
@@ -99,7 +99,7 @@ impl Drop for Writer {
 
 impl Writer {
     pub fn new() -> Writer {
-        let buf = SPARE.try_with(|spare| spare.borrow_mut().pop()).ok().flatten();
+        let buf = SPARE.try_with(|spare| spare.get().pop()).ok().flatten();
         Writer { buf: buf.unwrap_or_else(|| Vec::with_capacity(256)) }
     }
 

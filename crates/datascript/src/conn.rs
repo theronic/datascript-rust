@@ -4,9 +4,10 @@ use crate::coll::CljMap;
 use crate::datom::Datom;
 use crate::db::Db;
 use crate::error::Result;
+use crate::lock::{Guard, Lock};
 use crate::transact::{advance, TxReport};
 use crate::value::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// A listener: called with the report of each transaction.
 pub type Listener = Arc<dyn Fn(&TxReport) -> Result<()> + Send + Sync>;
@@ -20,12 +21,12 @@ struct Inner {
 
 /// `datascript.conn/Conn`. Cloning it gives the same connection.
 #[derive(Clone)]
-pub struct Conn(Arc<Mutex<Inner>>);
+pub struct Conn(Arc<Lock<Inner>>);
 
 impl Conn {
     /// `(conn-from-db db)`
     pub fn from_db(db: Db) -> Conn {
-        Conn(Arc::new(Mutex::new(Inner { db, order: CljMap::new(), listeners: Vec::new() })))
+        Conn(Arc::new(Lock::new(Inner { db, order: CljMap::new(), listeners: Vec::new() })))
     }
 
     /// `(create-conn schema)`
@@ -38,8 +39,8 @@ impl Conn {
         Ok(Conn::from_db(Db::init(datoms, schema)?))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> Guard<'_, Inner> {
+        self.0.lock()
     }
 
     /// `@conn`: the database as it is now.

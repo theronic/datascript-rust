@@ -8,8 +8,9 @@
 //! Lookbehind is not here.
 
 use crate::error::{Error, Result};
+use crate::lock::Lock;
 use crate::value::Regex;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::Arc;
 
 /// What `RegExp.prototype.exec` answers: where the match starts, in UTF-16 code units, and the groups, the whole
 /// match first.
@@ -20,42 +21,47 @@ pub struct Match {
 
 type Engine = dyn Fn(&str, &str, &str) -> Result<Option<Match>> + Send + Sync;
 
-fn engine() -> &'static RwLock<Option<Arc<Engine>>> {
-    static ENGINE: OnceLock<RwLock<Option<Arc<Engine>>>> = OnceLock::new();
-    ENGINE.get_or_init(Default::default)
+/// The host's regular expressions, when they stand in for this module's.
+static ENGINE: Lock<Option<Arc<Engine>>> = Lock::new(None);
+
+fn engine() -> Option<Arc<Engine>> {
+    // the lock is let go of before the host is called
+    ENGINE.lock().clone()
 }
 
 /// Puts the host's regular expressions in place of this module's: `f(source, flags, input)`.
 pub fn set_engine(f: Option<Arc<Engine>>) {
-    *engine().write().unwrap_or_else(|e| e.into_inner()) = f;
+    *ENGINE.lock() = f;
+}
+
+/// What a regular expression compiles to, kept by it once it is compiled.
+fn program(re: &Regex) -> Result<Arc<Program>> {
+    let kept = re.program.lock().clone();
+    let compiled = match kept {
+        Some(compiled) => compiled,
+        None => {
+            let compiled = compile(&re.source, &re.flags).map(Arc::new);
+            *re.program.lock() = Some(compiled.clone());
+            compiled
+        }
+    };
+    compiled.map_err(|e| Error::msg(format!("Invalid regular expression: /{}/: {e}", re.source)))
 }
 
 /// `re.exec(input)`
 pub fn exec(re: &Regex, input: &str) -> Result<Option<Match>> {
-    // the lock is let go of before the host is called
-    let host = engine().read().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(host) = host {
+    if let Some(host) = engine() {
         return host(&re.source, &re.flags, input);
     }
-    let program = re
-        .program
-        .get_or_init(|| compile(&re.source, &re.flags).map(Arc::new))
-        .as_ref()
-        .map_err(|e| Error::msg(format!("Invalid regular expression: /{}/: {e}", re.source)))?;
-    program.exec(input)
+    program(re)?.exec(input)
 }
 
 /// Whether the source is a regular expression at all: what `new RegExp` checks when it makes one.
 pub fn validate(re: &Regex) -> Result<()> {
-    let hosted = engine().read().unwrap_or_else(|e| e.into_inner()).is_some();
-    if hosted {
+    if engine().is_some() {
         return exec(re, "").map(|_| ());
     }
-    re.program
-        .get_or_init(|| compile(&re.source, &re.flags).map(Arc::new))
-        .as_ref()
-        .map(|_| ())
-        .map_err(|e| Error::msg(format!("Invalid regular expression: /{}/: {e}", re.source)))
+    program(re).map(|_| ())
 }
 
 // ---------------------------------------------------------------- syntax

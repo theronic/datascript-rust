@@ -8,10 +8,10 @@
 
 use crate::codec::{Reader, Writer, VECTOR};
 use crate::state::State;
+use datascript::lock::Slot;
 use datascript::value::{Func, HostObj, HostObject};
 use datascript::{Error, Result, Value};
 use std::any::Any;
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -131,15 +131,15 @@ pub fn log(level: u32, message: &str) {
 
 thread_local! {
     /// What the host answered its last call with
-    static REPLY: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static REPLY: Slot<Option<Vec<u8>>> = const { Slot::new(None) };
 }
 
 pub fn set_reply(bytes: Vec<u8>) {
-    REPLY.with(|r| *r.borrow_mut() = Some(bytes));
+    REPLY.with(|r| *r.get() = Some(bytes));
 }
 
 pub fn take_reply() -> Option<Vec<u8>> {
-    REPLY.with(|r| r.borrow_mut().take())
+    REPLY.with(|r| r.get().take())
 }
 
 // ---------------------------------------------------------------- functions

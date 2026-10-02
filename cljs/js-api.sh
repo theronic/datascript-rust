@@ -1,6 +1,7 @@
 #!/bin/bash
 # DataScript's JavaScript API over the WebAssembly module: cljs/target/js/datascript.js, packed as DataScript's own
-# release is (release-js/), and DataScript's own JavaScript tests (test/js/tests.js) run on it in Node.
+# release is (release-js/), and DataScript's own JavaScript tests (test/js/tests.js) run on it in Node. Then
+# cljs/overflow-test.js, on the same: the host's stack run out under the module, again and again.
 #   const d = require('./datascript.js');
 #   await d.instantiate(fetch('datascript.wasm'));      // or d.instantiate_sync(bytes)
 set -o errexit -o nounset -o pipefail
@@ -24,3 +25,5 @@ cat release-js/wrapper.prefix cljs/target/js/datascript.bare.js release-js/wrapp
 echo "cljs/target/js/datascript.js ($(wc -c < cljs/target/js/datascript.js | tr -d ' ') bytes)"
 
 DATASCRIPT_WASM="$WASM" node cljs/js-api-test.js
+# and the stack run out under the module, some hundreds of times
+DATASCRIPT_WASM="$WASM" node cljs/overflow-test.js "${OVERFLOWS:-300}"

@@ -28,8 +28,11 @@
 //!
 //! The module's code runs on the host's stack. A value nested deeper than that stack has room for — ClojureScript
 //! has the same limit, and tells of it with the same error — ends the call with the host's error, with nothing
-//! unwound. The host then puts the exported `__stack_pointer` back to what it was before the call and calls
-//! `ds_recover()`; the databases it holds are as they were.
+//! unwound; so does a host that calls the module with its own stack all but used up, a deep recursion of its own
+//! that reads the database at every level. The host then puts the exported `__stack_pointer` back to what it was
+//! before the call and calls `ds_recover()`. The databases it holds are as they were: the module holds no lock, and
+//! nothing half set, that a call cut short could leave shut (`datascript::lock`). What that call had allocated is
+//! not freed.
 //!
 //! `ds_edn(ptr, len)` is the same database for a host that would rather write EDN than encode values (`edn_api`).
 
@@ -46,30 +49,36 @@ pub mod ops;
 pub mod state;
 
 use codec::{Reader, Writer};
+use datascript::lock::Slot;
 use datascript::{Error, Value};
-use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The interface's version: a host checks it against the one it was written for.
 pub const ABI_VERSION: u32 = 1;
 
 thread_local! {
-    static RESULT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static RESULT: Slot<Vec<u8>> = const { Slot::new(Vec::new()) };
 }
 
 fn set_result(bytes: Vec<u8>) {
     // the answer before this one has been read: its buffer is written into again
-    let before = RESULT.with(|r| std::mem::replace(&mut *r.borrow_mut(), bytes));
+    let before = RESULT.with(|r| std::mem::replace(&mut *r.get(), bytes));
     codec::recycle(before);
 }
 
+/// What the module sets up once, before its first operation: where its failures are told, the generator `rand`,
+/// `rand-int` and the sampling aggregates draw from, and the tables the port builds the first time it needs them,
+/// which are built here, where the host's stack is as shallow as it gets.
 fn init() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        std::panic::set_hook(Box::new(|info| host::log(0, &format!("datascript: {info}"))));
-        // the generator `rand`, `rand-int` and the sampling aggregates draw from
-        let seed = (host::random() * 9007199254740992.0) as u64 ^ 0x9E37_79B9_7F4A_7C15;
-        datascript::built_ins::seed_random(seed);
-    });
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    std::panic::set_hook(Box::new(|info| host::log(0, &format!("datascript: {info}"))));
+    let seed = (host::random() * 9007199254740992.0) as u64 ^ 0x9E37_79B9_7F4A_7C15;
+    datascript::built_ins::seed_random(seed);
+    datascript::warm_up();
+    DONE.store(true, Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -130,12 +139,12 @@ pub unsafe extern "C" fn ds_call(op: u32, ptr: *mut u8, len: usize) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ds_result_ptr() -> *const u8 {
-    RESULT.with(|r| r.borrow().as_ptr())
+    RESULT.with(|r| r.get().as_ptr())
 }
 
 #[no_mangle]
 pub extern "C" fn ds_result_len() -> usize {
-    RESULT.with(|r| r.borrow().len())
+    RESULT.with(|r| r.get().len())
 }
 
 /// The host's answer to the call the module is making of it.

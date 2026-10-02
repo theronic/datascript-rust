@@ -22,6 +22,7 @@ pub mod edn;
 pub mod entity;
 pub mod error;
 pub mod hash;
+pub mod lock;
 pub mod lru;
 pub mod named;
 pub mod parser;
@@ -48,3 +49,13 @@ pub use pull_api::{pull, pull_many};
 pub use query::q;
 pub use transact::{advance, db_with, with, TxReport};
 pub use value::Value;
+
+/// Builds the tables the port builds the first time it needs them: its keywords, the functions a query may call by
+/// name, the aggregates. A host calls it once, when it starts, rather than leave them to whichever call comes
+/// first.
+pub fn warm_up() {
+    let _ = schema::kw();
+    let _ = built_ins::query_fn(&Symbol::parse("="));
+    let _ = built_ins::aggregate_fn(&Symbol::parse("count"));
+    let _ = Db::empty(Value::Nil);
+}

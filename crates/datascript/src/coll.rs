@@ -8,10 +8,9 @@
 //! ClojureScript's do.
 
 use crate::hash::{hamt_order, hash_map_entry, hash_unordered};
+use crate::lock::{HashCache, Slot};
 use crate::value::Value;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 /// The collections waiting to be dropped, and whether someone is dropping them.
 struct Pending {
@@ -20,7 +19,7 @@ struct Pending {
 }
 
 thread_local! {
-    static PENDING: RefCell<Pending> = const { RefCell::new(Pending { draining: false, queue: Vec::new() }) };
+    static PENDING: Slot<Pending> = const { Slot::new(Pending { draining: false, queue: Vec::new() }) };
 }
 
 /// Drops the collections that a collection being dropped held. They wait their turn in a list, and the first
@@ -28,7 +27,7 @@ thread_local! {
 /// dropped without a call for every level of it, which WebAssembly's stack has no room for.
 pub(crate) fn drop_nested(nested: Vec<Value>) {
     let first = PENDING.try_with(|pending| {
-        let mut pending = pending.borrow_mut();
+        let mut pending = pending.get();
         pending.queue.extend(nested);
         !std::mem::replace(&mut pending.draining, true)
     });
@@ -37,23 +36,16 @@ pub(crate) fn drop_nested(nested: Vec<Value>) {
         return;
     }
     // each is dropped outside the borrow: its own collections join the list
-    while let Some(next) = PENDING.with(|pending| pending.borrow_mut().queue.pop()) {
+    while let Some(next) = PENDING.with(|pending| pending.get().queue.pop()) {
         drop(next);
     }
-    PENDING.with(|pending| pending.borrow_mut().draining = false);
+    PENDING.with(|pending| pending.get().draining = false);
 }
 
 /// Lets the list of collections to drop be dropped again, after a drop that did not finish: a host whose stack ran
 /// out under the module calls this, since nothing unwinds there.
 pub fn recover_drops() {
-    let recovered = PENDING.try_with(|pending| match pending.try_borrow_mut() {
-        Ok(mut pending) => {
-            pending.draining = false;
-            true
-        }
-        Err(_) => false,
-    });
-    if recovered == Ok(true) {
+    if PENDING.try_with(|pending| pending.get().draining = false).is_ok() {
         drop_nested(Vec::new());
     }
 }
@@ -252,7 +244,7 @@ impl<'a, V> Iterator for ReprIter<'a, V> {
 #[derive(Clone)]
 pub struct CljMap {
     repr: Repr<Value>,
-    hash: OnceLock<i32>,
+    hash: HashCache,
 }
 
 impl Default for CljMap {
@@ -264,12 +256,12 @@ impl Default for CljMap {
 impl CljMap {
     /// `{}`
     pub fn new() -> CljMap {
-        CljMap { repr: Repr::Array(Vec::new()), hash: OnceLock::new() }
+        CljMap { repr: Repr::Array(Vec::new()), hash: HashCache::new() }
     }
 
     /// `(hash-map)`: a hash map however few its entries.
     pub fn new_hash() -> CljMap {
-        CljMap { repr: Repr::Hash { tree: BTreeMap::new(), next: 0 }, hash: OnceLock::new() }
+        CljMap { repr: Repr::Hash { tree: BTreeMap::new(), next: 0 }, hash: HashCache::new() }
     }
 
     /// `(array-map k v ...)`: an array map however many its entries; a later key replaces an earlier one's value.
@@ -281,12 +273,12 @@ impl CljMap {
                 None => a.push((k, v)),
             }
         }
-        CljMap { repr: Repr::Array(a), hash: OnceLock::new() }
+        CljMap { repr: Repr::Array(a), hash: HashCache::new() }
     }
 
     /// An array map of entries whose keys are known to differ, in their order: a map as another runtime held it.
     pub fn array_map_of_distinct(pairs: Vec<(Value, Value)>) -> CljMap {
-        CljMap { repr: Repr::Array(pairs), hash: OnceLock::new() }
+        CljMap { repr: Repr::Array(pairs), hash: HashCache::new() }
     }
 
     /// `(hash-map k v ...)`
@@ -343,19 +335,19 @@ impl CljMap {
 
     /// `assoc`. True when the key is new.
     pub fn assoc(&mut self, k: Value, v: Value) -> bool {
-        self.hash = OnceLock::new();
+        self.hash = HashCache::new();
         self.repr.insert(k, v)
     }
 
     /// `dissoc`
     pub fn dissoc(&mut self, k: &Value) -> Option<Value> {
-        self.hash = OnceLock::new();
+        self.hash = HashCache::new();
         self.repr.remove(k).map(|(_, v)| v)
     }
 
     /// `dissoc!` on a transient map
     pub fn dissoc_transient(&mut self, k: &Value) -> Option<Value> {
-        self.hash = OnceLock::new();
+        self.hash = HashCache::new();
         self.repr.remove_transient(k).map(|(_, v)| v)
     }
 
@@ -381,9 +373,7 @@ impl CljMap {
     }
 
     pub fn cljs_hash(&self) -> i32 {
-        *self
-            .hash
-            .get_or_init(|| hash_unordered(self.iter().map(|(k, v)| hash_map_entry(k.cljs_hash(), v.cljs_hash()))))
+        self.hash.get_or(|| hash_unordered(self.iter().map(|(k, v)| hash_map_entry(k.cljs_hash(), v.cljs_hash()))))
     }
 }
 
@@ -412,7 +402,7 @@ impl FromIterator<(Value, Value)> for CljMap {
 #[derive(Clone)]
 pub struct CljSet {
     repr: Repr<()>,
-    hash: OnceLock<i32>,
+    hash: HashCache,
 }
 
 impl Default for CljSet {
@@ -424,13 +414,13 @@ impl Default for CljSet {
 impl CljSet {
     /// `#{}`
     pub fn new() -> CljSet {
-        CljSet { repr: Repr::Array(Vec::new()), hash: OnceLock::new() }
+        CljSet { repr: Repr::Array(Vec::new()), hash: HashCache::new() }
     }
 
     /// A set that keeps its elements in the order given, however many: one of up to 8 that another runtime held.
     /// The elements are known to differ.
     pub fn array_set_of_distinct(items: Vec<Value>) -> CljSet {
-        CljSet { repr: Repr::Array(items.into_iter().map(|v| (v, ())).collect()), hash: OnceLock::new() }
+        CljSet { repr: Repr::Array(items.into_iter().map(|v| (v, ())).collect()), hash: HashCache::new() }
     }
 
     /// A set in the order of its elements' hashes, however few they are: one that was larger once.
@@ -439,7 +429,7 @@ impl CljSet {
         for v in items {
             repr.insert(v, ());
         }
-        CljSet { repr, hash: OnceLock::new() }
+        CljSet { repr, hash: HashCache::new() }
     }
 
     #[inline]
@@ -463,7 +453,7 @@ impl CljSet {
 
     /// `conj`. True when the element is new.
     pub fn insert(&mut self, v: Value) -> bool {
-        self.hash = OnceLock::new();
+        self.hash = HashCache::new();
         if self.repr.find(&v).is_some() {
             return false;
         }
@@ -472,7 +462,7 @@ impl CljSet {
 
     /// `disj`
     pub fn remove(&mut self, v: &Value) -> bool {
-        self.hash = OnceLock::new();
+        self.hash = HashCache::new();
         self.repr.remove(v).is_some()
     }
 
@@ -487,7 +477,7 @@ impl CljSet {
     }
 
     pub fn cljs_hash(&self) -> i32 {
-        *self.hash.get_or_init(|| hash_unordered(self.iter().map(Value::cljs_hash)))
+        self.hash.get_or(|| hash_unordered(self.iter().map(Value::cljs_hash)))
     }
 }
 

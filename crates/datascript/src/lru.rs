@@ -1,9 +1,9 @@
 //! `datascript.lru`: the cache of the last parsed queries and pull patterns. A key looked up again becomes the
 //! newest; a new key, once the cache holds more than its limit, puts out the oldest.
 
+use crate::lock::Lock;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
-use std::sync::Mutex;
 
 pub struct Lru<K, V> {
     key_value: HashMap<K, V>,
@@ -64,17 +64,17 @@ impl<K: Clone + Eq + Hash, V: Clone> Lru<K, V> {
 
 /// `lru/cache`: the cached value for a key, or the one `compute` makes, which is then cached.
 pub struct Cache<K, V> {
-    inner: Mutex<Lru<K, V>>,
+    inner: Lock<Lru<K, V>>,
 }
 
 impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
     pub fn new(limit: usize) -> Cache<K, V> {
-        Cache { inner: Mutex::new(Lru::new(limit)) }
+        Cache { inner: Lock::new(Lru::new(limit)) }
     }
 
     pub fn get<E>(&self, key: &K, compute: impl FnOnce() -> Result<V, E>) -> Result<V, E> {
         {
-            let mut lru = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lru = self.inner.lock();
             if let Some(cached) = lru.get(key).cloned() {
                 lru.assoc(key.clone(), cached.clone());
                 return Ok(cached);
@@ -82,7 +82,7 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
         }
         // computed outside the lock: computing may come back to this cache
         let computed = compute()?;
-        let mut lru = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lru = self.inner.lock();
         lru.assoc(key.clone(), computed.clone());
         Ok(computed)
     }

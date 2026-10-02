@@ -165,7 +165,13 @@
       (dotimes [_ 20]
         (is (thrown? js/RangeError (d/q '[:find ?s . :in ?x :where [(str ?x) ?s]] back))))
       (is (= 1 (d/q '[:find ?e . :where [?e :deep]] db)))
-      (is (= "Ivan" (d/q '[:find ?n . :where [1 :name ?n]] people))))))
+      (is (= "Ivan" (d/q '[:find ?n . :where [1 :name ?n]] people))))
+    (testing "a hash the stack had no room for is not half kept: it is asked for again, and runs out again"
+      ;; a join on the value hashes it, where it is, in the database
+      (let [db2 (d/db-with db [[:db/add 2 :deep back]])]
+        (dotimes [_ 5]
+          (is (thrown? js/RangeError (d/q '[:find ?e ?e2 :where [?e :deep ?v] [?e2 :deep ?v]] db2))))
+        (is (= #{[1] [2]} (d/q '[:find ?e :where [?e :deep]] db2)))))))
 
 (deftest test-databases-are-values
   (let [db1 (d/db-with (d/empty-db) [[:db/add 1 :name "Ivan"]])

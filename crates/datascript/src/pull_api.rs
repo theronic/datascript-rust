@@ -6,10 +6,11 @@ use crate::coll::CljMap;
 use crate::datom::{value_attr, Bound, Datom, Index, E0, EMAX, TX0, TXMAX};
 use crate::db::{entid, search, Cursor, Datoms, Db, Searchable};
 use crate::error::{Error, Result};
+use crate::lock::Lock;
 use crate::pull_parser::{parse_attr_name, parse_pattern, PullAttr, PullPattern};
 use crate::value::Value;
 use std::cmp::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// A pattern parsed for a database, and who to tell of what is pulled.
 pub struct ParsedOpts {
@@ -46,18 +47,18 @@ struct Run {
 
 #[derive(Clone)]
 struct DatomSeq {
-    run: Arc<Mutex<Run>>,
+    run: Arc<Lock<Run>>,
     pos: usize,
 }
 
 impl DatomSeq {
     fn of(datoms: Vec<Datom>) -> DatomSeq {
-        DatomSeq { run: Arc::new(Mutex::new(Run { read: datoms, rest: None })), pos: 0 }
+        DatomSeq { run: Arc::new(Lock::new(Run { read: datoms, rest: None })), pos: 0 }
     }
 
     fn lazy(datoms: Datoms) -> DatomSeq {
         let cursor = datoms.cursor();
-        DatomSeq { run: Arc::new(Mutex::new(Run { read: Vec::new(), rest: Some((datoms, cursor)) })), pos: 0 }
+        DatomSeq { run: Arc::new(Lock::new(Run { read: Vec::new(), rest: Some((datoms, cursor)) })), pos: 0 }
     }
 
     fn empty() -> DatomSeq {
@@ -66,7 +67,7 @@ impl DatomSeq {
 
     /// `first-seq`
     fn first(&self) -> Result<Option<Datom>> {
-        let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+        let mut run = self.run.lock();
         while run.read.len() <= self.pos {
             let Some((datoms, cursor)) = run.rest.as_mut() else { return Ok(None) };
             let chunk = datoms.next_chunk(cursor, 32)?;

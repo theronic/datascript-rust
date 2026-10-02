@@ -8,6 +8,7 @@ use crate::datom::value_attr;
 use crate::db::{entid, search};
 use crate::entity::entity;
 use crate::error::{Error, Result};
+use crate::lock::{Guard, Lazy, Lock};
 use crate::named::{compare_str, Keyword, Symbol};
 use crate::print::{pr_str, pr_str_all, print_str_all, str_of};
 use crate::value::{Func, Value};
@@ -15,7 +16,6 @@ use crate::{message, raise};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::OnceLock;
 
 type BuiltIn = fn(&[Value]) -> Result<Value>;
 
@@ -439,9 +439,9 @@ fn namespace(args: &[Value]) -> Result<Value> {
 }
 
 /// The types `type` has answered, by name (`Value::type_name`).
-fn types() -> std::sync::MutexGuard<'static, HashMap<String, Func>> {
-    static TYPES: OnceLock<std::sync::Mutex<HashMap<String, Func>>> = OnceLock::new();
-    TYPES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+fn types() -> Guard<'static, HashMap<String, Func>> {
+    static TYPES: Lazy<Lock<HashMap<String, Func>>> = Lazy::new();
+    TYPES.get_or_init(|| Lock::new(HashMap::new())).lock()
 }
 
 /// The type of that name: the same function for every value of the type. A host that has the type itself, a
@@ -598,7 +598,7 @@ pub fn call(f: &Value, args: &[Value]) -> Result<Value> {
 
 /// `built-ins/query-fns`
 pub fn query_fn(sym: &Symbol) -> Option<Value> {
-    static FNS: OnceLock<HashMap<&'static str, Value>> = OnceLock::new();
+    static FNS: Lazy<HashMap<&'static str, Value>> = Lazy::new();
     FNS.get_or_init(|| {
         let table: &[(&'static str, BuiltIn)] = &[
             ("=", eq),
@@ -856,7 +856,7 @@ fn rand_nth(coll: &[Value]) -> Result<Value> {
 
 /// `built-ins/aggregates`
 pub fn aggregate_fn(name: &Symbol) -> Option<Value> {
-    static FNS: OnceLock<HashMap<&'static str, Value>> = OnceLock::new();
+    static FNS: Lazy<HashMap<&'static str, Value>> = Lazy::new();
     FNS.get_or_init(|| {
         let table: &[(&'static str, BuiltIn)] = &[
             ("sum", |a| Ok(sum(&coll_arg(a, 0)?))),

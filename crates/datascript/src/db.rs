@@ -4,6 +4,7 @@
 use crate::datom::{attr_value, value_attr, Bound, Datom, Index, E0, EMAX, TX0, TXMAX};
 use crate::error::{Error, Result};
 use crate::hash::{hash_combine, hash_unordered};
+use crate::lock::{Guard, HashCache, Lock};
 use crate::named::Attr;
 use crate::schema::{kw, AttrProps, Schema};
 use crate::sorted_set::{Slice, SortedSet};
@@ -11,7 +12,7 @@ use crate::value::Value;
 use crate::{message, raise};
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::Arc;
 
 /// A predicate over datoms: a filtered database's.
 pub type Pred = Arc<dyn Fn(&Datom) -> Result<bool> + Send + Sync>;
@@ -46,8 +47,8 @@ pub(crate) struct Plain {
     schema: Arc<Schema>,
     max_eid: i32,
     max_tx: i32,
-    hash: OnceLock<i32>,
-    indexes: Mutex<Indexes>,
+    hash: HashCache,
+    indexes: Lock<Indexes>,
     /// How many times the indexes were made again: a place in them (`Cursor::place`) is good for one making
     epoch: AtomicU32,
 }
@@ -76,14 +77,14 @@ impl Plain {
             schema: core.schema.clone(),
             max_eid: core.max_eid,
             max_tx: core.max_tx,
-            hash: OnceLock::new(),
-            indexes: Mutex::new(Indexes::Here(Arc::new(core))),
+            hash: HashCache::new(),
+            indexes: Lock::new(Indexes::Here(Arc::new(core))),
             epoch: AtomicU32::new(0),
         }
     }
 
-    fn indexes(&self) -> MutexGuard<'_, Indexes> {
-        self.indexes.lock().unwrap_or_else(|e| e.into_inner())
+    fn indexes(&self) -> Guard<'_, Indexes> {
+        self.indexes.lock()
     }
 }
 
@@ -91,12 +92,12 @@ impl Drop for Plain {
     /// A long run of transactions on a connection leaves a chain of values, each kept by the one before it. The
     /// chain is let go of in a loop: a value dropping the next, which drops the next, would be a call a link.
     fn drop(&mut self) {
-        let mut link = std::mem::replace(self.indexes.get_mut().unwrap_or_else(|e| e.into_inner()), Indexes::Gone);
+        let mut link = std::mem::replace(self.indexes.get_mut(), Indexes::Gone);
         while let Indexes::Later { after, .. } = link {
             // the next value, if nothing else holds it: its own link is taken before it is dropped
             match Arc::try_unwrap(after.0) {
                 Ok(DbRepr::Plain(mut next)) => {
-                    link = std::mem::replace(next.indexes.get_mut().unwrap_or_else(|e| e.into_inner()), Indexes::Gone);
+                    link = std::mem::replace(next.indexes.get_mut(), Indexes::Gone);
                 }
                 _ => break,
             }
@@ -127,7 +128,7 @@ impl std::ops::Deref for CoreRef<'_> {
 pub(crate) struct Filtered {
     unfiltered: Db,
     pred: Pred,
-    hash: OnceLock<i32>,
+    hash: HashCache,
 }
 
 /// What searching needs of a database: the indexes, and the predicate of a filtered one. A transaction searches the
@@ -1178,7 +1179,7 @@ impl Db {
             Some(first) => Arc::new(move |d| Ok(first(d)? && pred(&of, d)?)),
             None => Arc::new(move |d| pred(&of, d)),
         };
-        Db(Arc::new(DbRepr::Filtered(Filtered { unfiltered, pred: combined, hash: OnceLock::new() })))
+        Db(Arc::new(DbRepr::Filtered(Filtered { unfiltered, pred: combined, hash: HashCache::new() })))
     }
 
     #[inline]
@@ -1281,8 +1282,8 @@ impl Db {
             hash_combine(self.plain().schema.value.cljs_hash(), hash_unordered(hashes))
         };
         match &*self.0 {
-            DbRepr::Plain(plain) => *plain.hash.get_or_init(compute),
-            DbRepr::Filtered(f) => *f.hash.get_or_init(compute),
+            DbRepr::Plain(plain) => plain.hash.get_or(compute),
+            DbRepr::Filtered(f) => f.hash.get_or(compute),
         }
     }
 

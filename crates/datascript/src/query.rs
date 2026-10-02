@@ -11,6 +11,7 @@ use crate::coll::{CljMap, CljSet};
 use crate::datom::{value_attr, Datom};
 use crate::db::{entid, entid_strict, props_of, resolve_tuple_refs, search, Db};
 use crate::error::{Error, Result};
+use crate::lock::Lazy;
 use crate::lru::Cache;
 use crate::named::Symbol;
 use crate::parser::{self, find_elements, find_vars, is_aggregate, is_pull, record_symbol};
@@ -19,7 +20,7 @@ use crate::value::Value;
 use crate::{message, raise};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------- relations
 
@@ -1640,7 +1641,7 @@ fn pull_rows(elements: &[Value], context: &Context, resultset: &[Value]) -> Resu
 
 /// The last queries parsed, by their forms (`*query-cache*`).
 fn query_cache() -> &'static Cache<Value, Value> {
-    static CACHE: OnceLock<Cache<Value, Value>> = OnceLock::new();
+    static CACHE: Lazy<Cache<Value, Value>> = Lazy::new();
     CACHE.get_or_init(|| Cache::new(100))
 }
 

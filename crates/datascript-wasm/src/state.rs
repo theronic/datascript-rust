@@ -1,8 +1,8 @@
 //! What the module keeps between calls: the databases and functions the host holds handles to.
 
+use datascript::lock::Slot;
 use datascript::value::{Func, WeakFunc};
 use datascript::{Db, Error, Result};
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// Entries by handle. A handle that is given up is given out again.
@@ -119,10 +119,10 @@ impl State {
 }
 
 thread_local! {
-    static STATE: RefCell<State> = RefCell::new(State::default());
+    static STATE: Slot<State> = Slot::new(State::default());
 }
 
 /// The state, for as long as `f` runs. `f` must not call the host: the host may call back, and the state is one.
 pub fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> T {
-    STATE.with(|s| f(&mut s.borrow_mut()))
+    STATE.with(|s| f(&mut s.get()))
 }

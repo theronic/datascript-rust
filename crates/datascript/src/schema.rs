@@ -7,13 +7,14 @@
 use crate::coll::{CljMap, CljSet};
 use crate::datom::value_attr;
 use crate::error::{Error, Result};
+use crate::lock::Lazy;
 use crate::lru::Cache;
 use crate::named::{Attr, Keyword};
 use crate::print::pr_str;
 use crate::value::Value;
 use crate::{message, raise};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// The keywords of a schema, interned once.
 pub(crate) struct Kw {
@@ -47,7 +48,7 @@ pub(crate) struct Kw {
 }
 
 pub(crate) fn kw() -> &'static Kw {
-    static KW: OnceLock<Kw> = OnceLock::new();
+    static KW: Lazy<Kw> = Lazy::new();
     KW.get_or_init(|| {
         let k = Keyword::parse;
         Kw {
@@ -122,7 +123,7 @@ pub struct Schema {
     uid: u32,
 }
 
-static NO_PROPS: OnceLock<AttrProps> = OnceLock::new();
+static NO_PROPS: Lazy<AttrProps> = Lazy::new();
 
 impl Schema {
     /// A schema validated, as `empty-db` and `init-db` take it.

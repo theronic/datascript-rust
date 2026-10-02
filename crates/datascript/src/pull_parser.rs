@@ -15,13 +15,14 @@ use crate::built_ins::query_fn;
 use crate::cmp::compare;
 use crate::db::{props_of, Db};
 use crate::error::{Error, Result};
+use crate::lock::Lazy;
 use crate::named::Keyword;
 use crate::print::pr_str;
 use crate::record::record;
 use crate::transact::{is_reverse_ref, reverse_ref};
 use crate::value::Value;
 use crate::{clj, raise};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// `PullAttr`
 #[derive(Clone)]
@@ -99,7 +100,7 @@ pub struct PullPattern {
 
 /// `default-db-id-attr`
 fn default_db_id_attr() -> Arc<PullAttr> {
-    static ATTR: OnceLock<Arc<PullAttr>> = OnceLock::new();
+    static ATTR: Lazy<Arc<PullAttr>> = Lazy::new();
     ATTR.get_or_init(|| {
         Arc::new(PullAttr {
             as_: Value::kw("db/id"),
@@ -121,13 +122,13 @@ fn default_db_id_attr() -> Arc<PullAttr> {
 
 /// `default-pattern-ref`: a reference pulls its `:db/id`
 fn default_pattern_ref() -> Arc<PullPattern> {
-    static P: OnceLock<Arc<PullPattern>> = OnceLock::new();
+    static P: Lazy<Arc<PullPattern>> = Lazy::new();
     P.get_or_init(|| Arc::new(PullPattern { attrs: vec![default_db_id_attr()], ..Default::default() })).clone()
 }
 
 /// `default-pattern-component`: a component pulls everything
 fn default_pattern_component() -> Arc<PullPattern> {
-    static P: OnceLock<Arc<PullPattern>> = OnceLock::new();
+    static P: Lazy<Arc<PullPattern>> = Lazy::new();
     P.get_or_init(|| Arc::new(PullPattern { attrs: vec![default_db_id_attr()], wildcard: true, ..Default::default() }))
         .clone()
 }

@@ -5,11 +5,12 @@ use crate::datom::Datom;
 use crate::db::Db;
 use crate::error::Result;
 use crate::hash;
+use crate::lock::{HashCache, Lock};
 use crate::named::{Keyword, Symbol};
 use std::any::Any;
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub type Str = Arc<str>;
 
@@ -44,12 +45,12 @@ pub enum Value {
 /// The elements of a vector or a list, with their hash once computed.
 pub struct Seq {
     items: Vec<Value>,
-    hash: OnceLock<i32>,
+    hash: HashCache,
 }
 
 impl Seq {
     pub fn new(items: Vec<Value>) -> Seq {
-        Seq { items, hash: OnceLock::new() }
+        Seq { items, hash: HashCache::new() }
     }
 
     #[inline]
@@ -62,7 +63,7 @@ impl Seq {
     }
 
     pub fn cljs_hash(&self) -> i32 {
-        *self.hash.get_or_init(|| hash::hash_ordered(self.items.iter().map(Value::cljs_hash)))
+        self.hash.get_or(|| hash::hash_ordered(self.items.iter().map(Value::cljs_hash)))
     }
 }
 
@@ -96,12 +97,12 @@ pub struct Regex {
     pub flags: Str,
     id: u32,
     /// What it compiles to, once it has been matched against
-    pub(crate) program: OnceLock<crate::regex::Compiled>,
+    pub(crate) program: Lock<Option<crate::regex::Compiled>>,
 }
 
 impl Regex {
     pub fn new(source: &str, flags: &str) -> Regex {
-        Regex { source: Arc::from(source), flags: Arc::from(flags), id: next_uid(), program: OnceLock::new() }
+        Regex { source: Arc::from(source), flags: Arc::from(flags), id: next_uid(), program: Lock::new(None) }
     }
 }
 

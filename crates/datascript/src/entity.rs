@@ -6,12 +6,13 @@ use crate::datom::{value_attr, Datom};
 use crate::db::{entid, numeric_eid_exists, props, search, Db};
 use crate::error::{Error, Result};
 use crate::hash::{hash_combine, hash_number};
+use crate::lock::{Guard, Lock};
 use crate::named::Attr;
 use crate::schema::kw;
 use crate::transact::{is_reverse_ref, reverse_ref};
 use crate::value::{HostObj, HostObject, Value};
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// How deep components are touched within components before the touch is given up as endless.
 const MAX_TOUCH_DEPTH: usize = 1000;
@@ -22,7 +23,7 @@ pub struct Entity(Arc<Inner>);
 struct Inner {
     db: Db,
     eid: i32,
-    state: Mutex<State>,
+    state: Lock<State>,
 }
 
 struct State {
@@ -55,7 +56,7 @@ impl Entity {
         Entity(Arc::new(Inner {
             db: db.clone(),
             eid,
-            state: Mutex::new(State { touched: false, cache: CljMap::new() }),
+            state: Lock::new(State { touched: false, cache: CljMap::new() }),
         }))
     }
 
@@ -72,8 +73,8 @@ impl Entity {
         self.0.eid
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.0.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn state(&self) -> Guard<'_, State> {
+        self.0.state.lock()
     }
 
     /// The entity as a value, as it is in a set of references.
@@ -296,7 +297,7 @@ impl HostObject for Inner {
     }
 
     fn pr_str(&self) -> String {
-        let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner()).cache.clone();
+        let mut m = self.state.lock().cache.clone();
         m.assoc(Value::Keyword(kw().db_id), Value::from(self.eid));
         crate::print::pr_str(&Value::map(m))
     }

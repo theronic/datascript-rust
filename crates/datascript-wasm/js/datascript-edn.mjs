@@ -57,7 +57,17 @@ export async function instantiate(source) {
     // memory the module takes over, and frees
     const ptr = exports.ds_alloc(bytes.length);
     new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
-    const status = exports.ds_edn(ptr, bytes.length);
+    // The module runs on this stack. Should the stack run out under it, the engine ends the call where it stands:
+    // the module's own stack is put back where it was, and the module told, before the error goes on its way.
+    const top = exports.__stack_pointer.value;
+    let status;
+    try {
+      status = exports.ds_edn(ptr, bytes.length);
+    } catch (e) {
+      exports.__stack_pointer.value = top;
+      exports.ds_recover();
+      throw e;
+    }
     // the answer stays where it is until the next call
     const answer = decoder.decode(new Uint8Array(exports.memory.buffer, exports.ds_result_ptr(), exports.ds_result_len()));
     if (status !== 0) {

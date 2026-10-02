@@ -84,6 +84,12 @@ The database is in the module, and a value on its way in or out is written into 
 - **JavaScript arrays** are vectors to the module.
 - A value nested deeper than the stack has room for, as a recursive pull makes, crosses without recursion.
 
+The module runs on its host's stack. When that runs out under it, in a recursion of the program's own that reads the
+database at every level, or over a value nested too deep to hash or print, JavaScript's `RangeError` is what the
+program is thrown, as it would be by ClojureScript DataScript, and the module is as it was before the call: it keeps
+nothing locked or half set that a call cut short could leave so, and the interface puts its stack back
+(`cljs/overflow-test.js` runs the stack out under it some thousand times).
+
 ### What differs
 
 - A database value is not a record of its indexes: `(:eavt db)` is the datoms of the index, in order, and not the
