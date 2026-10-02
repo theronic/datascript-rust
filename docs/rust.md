@@ -135,7 +135,7 @@ d.q('[:find ?n :where [?e "aka" "Tupen"] [?e "name" ?n]]', d.db(conn));   // [["
 ```
 
 **As EDN.** `ds_edn(ptr, len)` takes one operation as EDN text and answers its value as EDN text.
-`crates/datascript-wasm/js/datascript-edn.mjs` is a complete host in sixty lines, and the one to read before writing
+`crates/datascript-wasm/js/datascript-edn.mjs` is a complete host in ninety lines, and the one to read before writing
 another:
 
 ```js
@@ -201,8 +201,13 @@ ClojureScript interface, which checks what crosses the boundary.
 **DataScript's tests.** The tests of DataScript's public API in `test/` are compiled against `cljs/src` and run on
 the module in Node, with `:simple` and `:advanced` optimizations, beside tests of what is particular to the boundary
 (`cljs/test/datascript/test/wasm.cljs`): values that keep their identity, exceptions, long runs of datoms, values
-nested 20,000 deep, the stack running out and the module carrying on, and databases being let go of when the garbage
-collector says so.
+nested 20,000 deep, the stack running out and the module carrying on, a database as JSON text, and databases being
+let go of when the garbage collector says so.
+
+**The allocator.** `crates/datascript-wasm/js/leaf-check.mjs` reads the built module, and passes when the two
+functions that take memory and give it back call nothing and everything else that allocates calls only them: what
+`crates/datascript-wasm/src/heap.rs` promises of them. `cljs/overflow-test.js` is the other half of that: the stack
+run out under the module some hundreds of times, in a different place each time.
 
 ## How much memory it takes
 
