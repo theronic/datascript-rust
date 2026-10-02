@@ -32,7 +32,9 @@ pub fn set_engine(f: Option<Arc<Engine>>) {
 
 /// `re.exec(input)`
 pub fn exec(re: &Regex, input: &str) -> Result<Option<Match>> {
-    if let Some(host) = engine().read().unwrap_or_else(|e| e.into_inner()).clone() {
+    // the lock is let go of before the host is called
+    let host = engine().read().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(host) = host {
         return host(&re.source, &re.flags, input);
     }
     let program = re
@@ -45,7 +47,8 @@ pub fn exec(re: &Regex, input: &str) -> Result<Option<Match>> {
 
 /// Whether the source is a regular expression at all: what `new RegExp` checks when it makes one.
 pub fn validate(re: &Regex) -> Result<()> {
-    if engine().read().unwrap_or_else(|e| e.into_inner()).is_some() {
+    let hosted = engine().read().unwrap_or_else(|e| e.into_inner()).is_some();
+    if hosted {
         return exec(re, "").map(|_| ());
     }
     re.program

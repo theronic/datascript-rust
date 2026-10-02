@@ -57,8 +57,8 @@ impl Seq {
         &self.items
     }
 
-    pub fn into_items(self) -> Vec<Value> {
-        self.items
+    pub fn into_items(mut self) -> Vec<Value> {
+        std::mem::take(&mut self.items)
     }
 
     pub fn cljs_hash(&self) -> i32 {
@@ -69,6 +69,15 @@ impl Seq {
 impl Clone for Seq {
     fn clone(&self) -> Seq {
         Seq::new(self.items.clone())
+    }
+}
+
+impl Drop for Seq {
+    fn drop(&mut self) {
+        if self.items.iter().any(Value::nests) {
+            let items = std::mem::take(&mut self.items);
+            crate::coll::drop_nested(items.into_iter().filter(Value::nests).collect());
+        }
     }
 }
 
@@ -188,6 +197,20 @@ impl Func {
     #[inline]
     pub fn ptr_eq(&self, other: &Func) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// A reference that does not keep the function: for a table that hands the same function out again while
+    /// something still holds it.
+    pub fn downgrade(&self) -> WeakFunc {
+        WeakFunc(Arc::downgrade(&self.0))
+    }
+}
+
+pub struct WeakFunc(std::sync::Weak<FuncInner>);
+
+impl WeakFunc {
+    pub fn upgrade(&self) -> Option<Func> {
+        self.0.upgrade().map(Func)
     }
 }
 
@@ -434,6 +457,13 @@ impl Value {
     #[inline]
     pub fn is_sequential(&self) -> bool {
         matches!(self, Value::Vector(_) | Value::List(_))
+    }
+
+    /// Whether it is a collection that may hold others: what is dropped by a list and not by the call stack
+    /// (`coll::drop_nested`).
+    #[inline]
+    pub(crate) fn nests(&self) -> bool {
+        matches!(self, Value::Vector(_) | Value::List(_) | Value::Map(_) | Value::Set(_))
     }
 
     /// `coll?`

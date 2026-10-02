@@ -134,11 +134,6 @@ macro_rules! named_type {
                 &self.0.full
             }
 
-            #[inline]
-            pub(crate) fn full_arc(&self) -> &Arc<str> {
-                &self.0.full
-            }
-
             /// ClojureScript's hash of it
             #[inline]
             pub fn hash(&self) -> i32 {

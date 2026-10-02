@@ -44,7 +44,6 @@ pub(crate) struct Kw {
     pub db_fn_retract_entity: Keyword,
     pub db_retract_entity: Keyword,
     pub db_current_tx: Keyword,
-    pub error: Keyword,
 }
 
 pub(crate) fn kw() -> &'static Kw {
@@ -79,7 +78,6 @@ pub(crate) fn kw() -> &'static Kw {
             db_fn_retract_entity: k("db.fn/retractEntity"),
             db_retract_entity: k("db/retractEntity"),
             db_current_tx: k("db/current-tx"),
-            error: k("error"),
         }
     })
 }
@@ -120,6 +118,8 @@ pub struct Schema {
     /// The last pull patterns parsed against this schema, and the attributes a wildcard met
     pub(crate) pull_patterns: Cache<Value, Arc<crate::pull_parser::PullPattern>>,
     pub(crate) pull_attrs: Cache<Value, Arc<crate::pull_parser::PullAttr>>,
+    /// A number that is this schema's alone, for a host that keeps what it has read of a schema
+    uid: u32,
 }
 
 static NO_PROPS: OnceLock<AttrProps> = OnceLock::new();
@@ -146,7 +146,16 @@ impl Schema {
             has_tuples,
             pull_patterns: Cache::new(100),
             pull_attrs: Cache::new(100),
+            uid: {
+                static UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+                UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         }
+    }
+
+    /// The schema's own number: two database values of one number have one schema.
+    pub fn uid(&self) -> u32 {
+        self.uid
     }
 
     #[inline]

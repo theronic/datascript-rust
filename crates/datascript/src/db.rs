@@ -1158,8 +1158,3 @@ pub fn diff(a: &Db, b: &Db) -> Result<Value> {
     let not_empty = |v: Vec<Value>| if v.is_empty() { Value::Nil } else { Value::vector(v) };
     Ok(Value::vector(vec![not_empty(only_a), not_empty(only_b), not_empty(both)]))
 }
-
-/// An attribute as the value it was given as.
-pub(crate) fn attr_as_value(a: &Attr) -> Value {
-    attr_value(a)
-}

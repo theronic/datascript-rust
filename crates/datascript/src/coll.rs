@@ -9,8 +9,96 @@
 
 use crate::hash::{hamt_order, hash_map_entry, hash_unordered};
 use crate::value::Value;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+
+/// The collections waiting to be dropped, and whether someone is dropping them.
+struct Pending {
+    draining: bool,
+    queue: Vec<Value>,
+}
+
+thread_local! {
+    static PENDING: RefCell<Pending> = const { RefCell::new(Pending { draining: false, queue: Vec::new() }) };
+}
+
+/// Drops the collections that a collection being dropped held. They wait their turn in a list, and the first
+/// collection to be dropped drops them all: a value nested thousands deep, which a recursive pull makes, is then
+/// dropped without a call for every level of it, which WebAssembly's stack has no room for.
+pub(crate) fn drop_nested(nested: Vec<Value>) {
+    let first = PENDING.try_with(|pending| {
+        let mut pending = pending.borrow_mut();
+        pending.queue.extend(nested);
+        !std::mem::replace(&mut pending.draining, true)
+    });
+    // no list any more, as a thread ends: `nested` was dropped as it is
+    if first != Ok(true) {
+        return;
+    }
+    // each is dropped outside the borrow: its own collections join the list
+    while let Some(next) = PENDING.with(|pending| pending.borrow_mut().queue.pop()) {
+        drop(next);
+    }
+    PENDING.with(|pending| pending.borrow_mut().draining = false);
+}
+
+/// Lets the list of collections to drop be dropped again, after a drop that did not finish: a host whose stack ran
+/// out under the module calls this, since nothing unwinds there.
+pub fn recover_drops() {
+    let recovered = PENDING.try_with(|pending| match pending.try_borrow_mut() {
+        Ok(mut pending) => {
+            pending.draining = false;
+            true
+        }
+        Err(_) => false,
+    });
+    if recovered == Ok(true) {
+        drop_nested(Vec::new());
+    }
+}
+
+/// The collections among a map's or a set's keys and values, taken out of it.
+fn take_nested<V: Nested>(repr: &mut Repr<V>) -> Vec<Value> {
+    let mut nested = Vec::new();
+    let mut keep = |k: Value, v: V| {
+        if k.nests() {
+            nested.push(k);
+        }
+        v.keep(&mut nested);
+    };
+    match std::mem::replace(repr, Repr::Array(Vec::new())) {
+        Repr::Array(entries) => entries.into_iter().for_each(|(k, v)| keep(k, v)),
+        Repr::Hash { tree, .. } => tree.into_values().for_each(|(k, v)| keep(k, v)),
+    }
+    nested
+}
+
+/// What a map's value or a set's lack of one adds to the collections to drop.
+trait Nested {
+    fn nests(&self) -> bool;
+    fn keep(self, nested: &mut Vec<Value>);
+}
+
+impl Nested for Value {
+    fn nests(&self) -> bool {
+        Value::nests(self)
+    }
+
+    fn keep(self, nested: &mut Vec<Value>) {
+        if Value::nests(&self) {
+            nested.push(self);
+        }
+    }
+}
+
+impl Nested for () {
+    fn nests(&self) -> bool {
+        false
+    }
+
+    fn keep(self, _: &mut Vec<Value>) {}
+}
 
 /// `PersistentArrayMap.HASHMAP-THRESHOLD`
 pub const HASHMAP_THRESHOLD: usize = 8;
@@ -196,6 +284,11 @@ impl CljMap {
         CljMap { repr: Repr::Array(a), hash: OnceLock::new() }
     }
 
+    /// An array map of entries whose keys are known to differ, in their order: a map as another runtime held it.
+    pub fn array_map_of_distinct(pairs: Vec<(Value, Value)>) -> CljMap {
+        CljMap { repr: Repr::Array(pairs), hash: OnceLock::new() }
+    }
+
     /// `(hash-map k v ...)`
     pub fn hash_map<I: IntoIterator<Item = (Value, Value)>>(pairs: I) -> CljMap {
         let mut m = CljMap::new_hash();
@@ -294,6 +387,14 @@ impl CljMap {
     }
 }
 
+impl Drop for CljMap {
+    fn drop(&mut self) {
+        if self.repr.iter().any(|(k, v)| k.nests() || Nested::nests(v)) {
+            drop_nested(take_nested(&mut self.repr));
+        }
+    }
+}
+
 impl PartialEq for CljMap {
     /// `equiv-map`
     fn eq(&self, other: &CljMap) -> bool {
@@ -324,6 +425,21 @@ impl CljSet {
     /// `#{}`
     pub fn new() -> CljSet {
         CljSet { repr: Repr::Array(Vec::new()), hash: OnceLock::new() }
+    }
+
+    /// A set that keeps its elements in the order given, however many: one of up to 8 that another runtime held.
+    /// The elements are known to differ.
+    pub fn array_set_of_distinct(items: Vec<Value>) -> CljSet {
+        CljSet { repr: Repr::Array(items.into_iter().map(|v| (v, ())).collect()), hash: OnceLock::new() }
+    }
+
+    /// A set in the order of its elements' hashes, however few they are: one that was larger once.
+    pub fn hash_set<I: IntoIterator<Item = Value>>(items: I) -> CljSet {
+        let mut repr = Repr::Hash { tree: BTreeMap::new(), next: 0 };
+        for v in items {
+            repr.insert(v, ());
+        }
+        CljSet { repr, hash: OnceLock::new() }
     }
 
     #[inline]
@@ -372,6 +488,14 @@ impl CljSet {
 
     pub fn cljs_hash(&self) -> i32 {
         *self.hash.get_or_init(|| hash_unordered(self.iter().map(Value::cljs_hash)))
+    }
+}
+
+impl Drop for CljSet {
+    fn drop(&mut self) {
+        if self.repr.iter().any(|(k, _)| k.nests()) {
+            drop_nested(take_nested(&mut self.repr));
+        }
     }
 }
 
