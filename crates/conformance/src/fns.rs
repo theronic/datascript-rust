@@ -87,7 +87,7 @@ fn make(name: &str) -> Option<Value> {
         "five" => f(name, |_| Ok(Value::from(5))),
         "when-even" => f(name, |a| {
             let x = arg(a, 0);
-            Ok(if call(&built_in("even?"), &[x.clone()])?.truthy() { x } else { Value::Nil })
+            Ok(if call(&built_in("even?"), std::slice::from_ref(&x))?.truthy() { x } else { Value::Nil })
         }),
         "first" => f(name, |a| Ok(clj::seq(&arg(a, 0))?.into_iter().next().unwrap_or(Value::Nil))),
         "second" => f(name, |a| Ok(clj::seq(&arg(a, 0))?.into_iter().nth(1).unwrap_or(Value::Nil))),
@@ -109,7 +109,7 @@ fn make(name: &str) -> Option<Value> {
         "kv" => f(name, |a| Ok(Value::vector(clj::seq(&arg(a, 0))?))),
         "throw-odd" => f(name, |a| {
             let x = arg(a, 0);
-            if call(&built_in("odd?"), &[x.clone()])?.truthy() {
+            if call(&built_in("odd?"), std::slice::from_ref(&x))?.truthy() {
                 Err(Error::new("odd", Value::kw_map(&[("error", Value::kw("host/odd"))])))
             } else {
                 Ok(x)

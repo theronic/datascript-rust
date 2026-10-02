@@ -208,7 +208,7 @@ pub fn contains(coll: &Value, k: &Value) -> Result<bool> {
 
 /// `(assoc m k v ...)` on a map, a vector or `nil`.
 pub fn assoc(coll: &Value, kvs: &[Value]) -> Result<Value> {
-    if kvs.len() % 2 != 0 {
+    if !kvs.len().is_multiple_of(2) {
         return Err(Error::msg("assoc expects even number of arguments after map/vector, found odd number"));
     }
     match coll {

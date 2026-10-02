@@ -179,7 +179,7 @@ impl Bound {
 
     /// The bound a datom itself makes.
     pub fn of(d: &Datom) -> Bound {
-        Bound { e: d.e, a: Some(d.a.clone()), v: d.v.clone(), tx: d.tx() }
+        Bound { e: d.e, a: Some(d.a), v: d.v.clone(), tx: d.tx() }
     }
 }
 

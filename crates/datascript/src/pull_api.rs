@@ -423,7 +423,7 @@ fn run(frame: Frame, opts: &ParsedOpts) -> Result<Vec<Frame>> {
             let datoms = if db.is_filtered() {
                 search(db, None, Some(&name), Some(&target), None).to_vec()?
             } else {
-                let from = Bound::new(E0, Some(name.clone()), target.clone(), TX0);
+                let from = Bound::new(E0, Some(name), target.clone(), TX0);
                 let to = Bound::new(EMAX, Some(name), target.clone(), TXMAX);
                 db.core().slice_between(Index::Avet, &from, &to)?
             };

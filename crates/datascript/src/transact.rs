@@ -162,7 +162,7 @@ fn auto_tempids_entity(db: &DbCore, entity: &Value) -> Result<Value> {
     let kw = kw();
     match entity {
         Value::Map(m) => {
-            let db_id = Value::Keyword(kw.db_id.clone());
+            let db_id = Value::Keyword(kw.db_id);
             let mut with_id;
             let source: &CljMap = if m.contains_key(&db_id) {
                 m
@@ -346,7 +346,7 @@ fn transact_add(report: &mut Report, e: &Value, a: &Value, v: &Value, tx: Option
             Ok(())
         }
         Some(old) => {
-            transact_report(report, Datom::with_added(e, attr.clone(), old.v, tx, false))?;
+            transact_report(report, Datom::with_added(e, attr, old.v, tx, false))?;
             transact_report(report, Datom::new(e, attr, v, tx))
         }
     }
@@ -355,13 +355,13 @@ fn transact_add(report: &mut Report, e: &Value, a: &Value, v: &Value, tx: Option
 /// `transact-retract-datom`
 fn transact_retract_datom(report: &mut Report, d: &Datom) -> Result<()> {
     let tx = report.current_tx();
-    transact_report(report, Datom::with_added(d.e, d.a.clone(), d.v.clone(), tx, false))
+    transact_report(report, Datom::with_added(d.e, d.a, d.v.clone(), tx, false))
 }
 
 /// `retract-components`: a retraction of each entity these datoms hold as a component, as the set ClojureScript
 /// makes of them.
 fn retract_components(db: &DbCore, datoms: &[Datom]) -> Vec<Value> {
-    let op = Value::Keyword(kw().db_fn_retract_entity.clone());
+    let op = Value::Keyword(kw().db_fn_retract_entity);
     let set: CljSet = datoms
         .iter()
         .filter(|d| props(db, &d.a).component)
@@ -494,7 +494,7 @@ fn validate_upserts(entity: &CljMap, upserts: &CljMap) -> Result<Option<i32>> {
              "conflict" => Value::vector(vec![e2.clone(), part(av2, 0), part(av2, 1)])})
     }
     let Some((upsert_id, av)) = first else { return Ok(None) };
-    let eid = entity.get(&Value::Keyword(kw().db_id.clone())).cloned().unwrap_or(Value::Nil);
+    let eid = entity.get(&Value::Keyword(kw().db_id)).cloned().unwrap_or(Value::Nil);
     if upsert_id.is_some() && eid.is_some() && !is_tempid(&eid) && *upsert_id != eid {
         let part = |i: usize| av.as_seq().map(|s| s[i].clone()).unwrap_or(Value::Nil);
         raise!("Conflicting upsert: ", av, " resolves to ", upsert_id, ", but entity already has :db/id ", eid;
@@ -534,7 +534,7 @@ struct Explode {
 }
 
 fn explode(db: &DbCore, entity: &CljMap) -> Explode {
-    let eid = entity.get(&Value::Keyword(kw().db_id.clone())).cloned().unwrap_or(Value::Nil);
+    let eid = entity.get(&Value::Keyword(kw().db_id)).cloned().unwrap_or(Value::Nil);
     let (mut plain, mut tuples) = (Vec::new(), Vec::new());
     for (a, vs) in entity.iter() {
         if props_of(db, a).tuple {
@@ -559,11 +559,8 @@ fn expand(mut ex: Explode, db: &DbCore, es: &mut VecDeque<Item>) -> Result<()> {
         if a.is_kw(&kw.db_id) {
             continue;
         }
-        let context = || {
-            Value::map(
-                [(Value::Keyword(kw.db_id.clone()), ex.eid.clone()), (a.clone(), vs.clone())].into_iter().collect(),
-            )
-        };
+        let context =
+            || Value::map([(Value::Keyword(kw.db_id), ex.eid.clone()), (a.clone(), vs.clone())].into_iter().collect());
         validate_attr(&a, context)?;
         let reverse = is_reverse_ref(&a)?;
         let straight_a = if reverse { reverse_ref(&a)? } else { a.clone() };
@@ -581,9 +578,9 @@ fn expand(mut ex: Explode, db: &DbCore, es: &mut VecDeque<Item>) -> Result<()> {
                 nested.assoc(reverse_ref(&a)?, ex.eid.clone());
                 ops.push(Value::map(nested));
             } else if reverse {
-                ops.push(vec4(&Value::Keyword(kw.db_add.clone()), v, &straight_a, ex.eid.clone()));
+                ops.push(vec4(&Value::Keyword(kw.db_add), v, &straight_a, ex.eid.clone()));
             } else {
-                ops.push(vec4(&Value::Keyword(kw.db_add.clone()), ex.eid.clone(), &straight_a, v));
+                ops.push(vec4(&Value::Keyword(kw.db_add), ex.eid.clone(), &straight_a, v));
             }
         }
     }
@@ -624,14 +621,14 @@ fn flush_tuples(report: &Report) -> Result<Vec<Item>> {
             }
             if value.is_nil() {
                 out.push(Item::Internal(Value::vector(vec![
-                    Value::Keyword(kw.db_retract.clone()),
+                    Value::Keyword(kw.db_retract),
                     eid.clone(),
                     tuple.clone(),
                     current,
                 ])));
             } else {
                 out.push(Item::Internal(Value::vector(vec![
-                    Value::Keyword(kw.db_add.clone()),
+                    Value::Keyword(kw.db_add),
                     eid.clone(),
                     tuple.clone(),
                     value,
@@ -781,7 +778,7 @@ fn run(mut report: Report, initial_es: &[Value], has_tuples: bool) -> Result<Out
             Value::Nil => continue,
 
             Value::Map(m) => {
-                let db_id = Value::Keyword(kw.db_id.clone());
+                let db_id = Value::Keyword(kw.db_id);
                 let old_eid = m.get(&db_id).cloned().unwrap_or(Value::Nil);
 
                 // :db/current-tx, "datomic.tx": the transaction itself
@@ -931,7 +928,7 @@ fn run(mut report: Report, initial_es: &[Value], has_tuples: bool) -> Result<Out
                                  "expected" => ov.clone(), "new" => nv.clone()})
                         }
                     }
-                    let add = vec4(&Value::Keyword(kw.db_add.clone()), Value::from(e), &a, nv.clone());
+                    let add = vec4(&Value::Keyword(kw.db_add), Value::from(e), &a, nv.clone());
                     transact_add(&mut report, &Value::from(e), &a, &nv, None, &add)?;
                     continue;
                 }
@@ -1118,7 +1115,7 @@ fn run(mut report: Report, initial_es: &[Value], has_tuples: bool) -> Result<Out
             Value::Datom(d) => {
                 if d.added() {
                     let add = Value::vector(vec![
-                        Value::Keyword(kw.db_add.clone()),
+                        Value::Keyword(kw.db_add),
                         Value::from(d.e),
                         d.a_value(),
                         d.v.clone(),
@@ -1127,7 +1124,7 @@ fn run(mut report: Report, initial_es: &[Value], has_tuples: bool) -> Result<Out
                     transact_add(&mut report, &Value::from(d.e), &d.a_value(), &d.v, Some(&Value::from(d.tx())), &add)?;
                 } else {
                     es.push_front(Item::Entity(vec4(
-                        &Value::Keyword(kw.db_retract.clone()),
+                        &Value::Keyword(kw.db_retract),
                         Value::from(d.e),
                         &d.a_value(),
                         d.v.clone(),
@@ -1149,7 +1146,7 @@ fn run(mut report: Report, initial_es: &[Value], has_tuples: bool) -> Result<Out
             tempids.assoc(k.clone(), v.clone());
         }
     }
-    tempids.assoc(Value::Keyword(kw.db_current_tx.clone()), Value::from(report.current_tx()));
+    tempids.assoc(Value::Keyword(kw.db_current_tx), Value::from(report.current_tx()));
     report.tempids = tempids;
     report.db.max_tx += 1;
     Ok(Outcome::Done(Box::new(report)))

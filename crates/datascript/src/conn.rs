@@ -81,7 +81,7 @@ impl Conn {
                 .all()
                 .to_vec()?
                 .into_iter()
-                .map(|d| Datom::with_added(d.e, d.a.clone(), d.v.clone(), d.tx(), false))
+                .map(|d| Datom::with_added(d.e, d.a, d.v.clone(), d.tx(), false))
                 .collect();
             tx_data.extend(db.all().to_vec()?);
             let report = TxReport { db_before: before, db_after: db.clone(), tx_data, tempids: Value::Nil, tx_meta };

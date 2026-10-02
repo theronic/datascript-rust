@@ -571,7 +571,7 @@ fn run_step(env: &Env, step: &Value) -> Result<(String, Value)> {
         "cljs/disj" => (p(&clj::disj(&arg("coll")?, &seq_arg(&arg("xs")?)?)?), nothing),
         "cljs/sort" => {
             let mut items = seq_arg(&arg("vals")?)?;
-            clj::sort_by(&mut items, |a, b| datascript::cmp::value_compare_checked(a, b))?;
+            clj::sort_by(&mut items, datascript::cmp::value_compare_checked)?;
             let _ = value_compare;
             (p(&Value::vector(items)), nothing)
         }

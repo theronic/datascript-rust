@@ -48,6 +48,10 @@ impl<T> Slab<T> {
     pub fn len(&self) -> usize {
         self.items.len() - self.free.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Default)]

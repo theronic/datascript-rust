@@ -8,7 +8,7 @@
 //! [:q query input ...]
 //! [:pull db pattern eid]   [:pull-many db pattern eids]
 //! [:datoms db index c0 ...]   [:seek-datoms …]   [:rseek-datoms …]   [:index-range db attr start end]
-//! [:entid db eid]   [:schema db]   [:count db]
+//! [:entid db eid]   [:entity db eid]   [:schema db]   [:count db]
 //! [:serializable db]   [:from-serializable "json"]
 //! [:db-string db]   [:read-db "#datascript/DB {...}"]
 //! [:release db]
@@ -135,6 +135,14 @@ fn run(text: &str) -> Result<Value> {
         }
         "index-range" => datoms_value(db::index_range(&db_of(arg(1))?, arg(2), arg(3), arg(4))?.to_vec()?),
         "entid" => db_of(arg(1))?.entid_value(arg(2))?,
+        // the entity with all it has, as `(d/touch (d/entity db eid))` prints: `nil` when there is none
+        "entity" => match datascript::entity(&db_of(arg(1))?, arg(2))? {
+            Some(e) => {
+                e.touch()?;
+                Value::map(e.print_map())
+            }
+            None => Value::Nil,
+        },
         "schema" => db_of(arg(1))?.schema_value(),
         "count" => Value::from(db_of(arg(1))?.count()?),
         "serializable" => {

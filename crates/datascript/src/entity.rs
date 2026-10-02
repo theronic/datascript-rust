@@ -149,7 +149,7 @@ impl Entity {
         let mut cache = CljMap::new();
         let mut start = 0;
         while start < datoms.len() {
-            let a = datoms[start].a.clone();
+            let a = datoms[start].a;
             let end = datoms[start..].iter().position(|d| d.a != a).map_or(datoms.len(), |n| start + n);
             cache.assoc(datoms[start].a_value(), entity_attr(db, &a, &datoms[start..end])?);
             start = end;
@@ -233,7 +233,7 @@ impl Entity {
     /// `(assoc @cache :db/id eid)`: the map an entity prints as.
     pub fn print_map(&self) -> CljMap {
         let mut m = self.state().cache.clone();
-        m.assoc(Value::Keyword(kw().db_id.clone()), Value::from(self.0.eid));
+        m.assoc(Value::Keyword(kw().db_id), Value::from(self.0.eid));
         m
     }
 
@@ -297,7 +297,7 @@ impl HostObject for Inner {
 
     fn pr_str(&self) -> String {
         let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner()).cache.clone();
-        m.assoc(Value::Keyword(kw().db_id.clone()), Value::from(self.eid));
+        m.assoc(Value::Keyword(kw().db_id), Value::from(self.eid));
         crate::print::pr_str(&Value::map(m))
     }
 

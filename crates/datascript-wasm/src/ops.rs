@@ -242,7 +242,7 @@ fn freezer<'a>(f: &'a Value) -> Option<Box<dyn Fn(&Value) -> Result<Json> + 'a>>
     if f.is_nil() {
         return None;
     }
-    Some(Box::new(move |v| Ok(Json::from_value(&built_ins::call(f, &[v.clone()])?))))
+    Some(Box::new(move |v| Ok(Json::from_value(&built_ins::call(f, std::slice::from_ref(v))?))))
 }
 
 fn thawer<'a>(f: &'a Value) -> Option<Box<dyn Fn(&Json) -> Result<Value> + 'a>> {

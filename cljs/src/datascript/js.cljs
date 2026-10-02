@@ -6,7 +6,14 @@
     [clojure.walk :as walk]
     [datascript.conn :as conn]
     [datascript.core :as d]
-    [datascript.serialize :as serialize]))
+    [datascript.serialize :as serialize]
+    [datascript.wasm :as wasm]))
+
+;; The WebAssembly module, which a program loads before it calls anything else here: from a Response, bytes or a
+;; compiled WebAssembly.Module, a promise; or from bytes at once, where compiling may block
+
+(def ^:export instantiate wasm/instantiate)
+(def ^:export instantiate_sync wasm/instantiate-sync)
 
 ;; Conversions
 

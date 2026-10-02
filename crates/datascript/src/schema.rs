@@ -206,10 +206,7 @@ fn build_rschema(schema: &Value) -> (Value, HashMap<Attr, AttrProps>, Vec<Attr>)
     let kw = kw();
     // {:db/ident {:db/unique :db.unique/identity}}, then the schema's own entries
     let mut merged = CljMap::new();
-    merged.assoc(
-        Value::Keyword(kw.db_ident.clone()),
-        Value::kw_map(&[("db/unique", Value::Keyword(kw.db_unique_identity.clone()))]),
-    );
+    merged.assoc(Value::Keyword(kw.db_ident), Value::kw_map(&[("db/unique", Value::Keyword(kw.db_unique_identity))]));
     if let Value::Map(m) = schema {
         for (a, s) in m.iter() {
             merged.assoc(a.clone(), s.clone());
@@ -252,7 +249,7 @@ fn build_rschema(schema: &Value) -> (Value, HashMap<Attr, AttrProps>, Vec<Attr>)
     if let Value::Map(m) = schema {
         for (attr, attr_schema) in m.iter() {
             let (Some(a), Value::Map(s)) = (value_attr(attr), attr_schema) else { continue };
-            let get = |k: &Keyword| s.get(&Value::Keyword(k.clone())).cloned();
+            let get = |k: &Keyword| s.get(&Value::Keyword(*k)).cloned();
             let (ta, tt, t) = (get(&kw.db_tuple_attrs), get(&kw.db_tuple_types), get(&kw.db_tuple_type));
             if ta.is_some() || tt.is_some() || t.is_some() {
                 let p = props.entry(a).or_default();
@@ -265,7 +262,7 @@ fn build_rschema(schema: &Value) -> (Value, HashMap<Attr, AttrProps>, Vec<Attr>)
 
     // :db/attrTuples: {source-attr {tuple-attr index}}
     let mut attr_tuples = CljMap::new();
-    if let Some(Value::Set(tuples)) = rs.get(&Value::Keyword(kw.db_tuple_attrs.clone())) {
+    if let Some(Value::Set(tuples)) = rs.get(&Value::Keyword(kw.db_tuple_attrs)) {
         for tuple_attr in tuples.iter() {
             let sources = schema.get(tuple_attr).and_then(|s| s.get_kw(&kw.db_tuple_attrs)).and_then(Value::seq_items);
             for (idx, src) in sources.unwrap_or_default().into_iter().enumerate() {
@@ -284,11 +281,11 @@ fn build_rschema(schema: &Value) -> (Value, HashMap<Attr, AttrProps>, Vec<Attr>)
         props.entry(src).or_default().attr_tuples = list;
     }
 
-    let ref_attrs = match rs.get(&Value::Keyword(kw.db_type_ref.clone())) {
+    let ref_attrs = match rs.get(&Value::Keyword(kw.db_type_ref)) {
         Some(Value::Set(s)) => s.iter().filter_map(value_attr).collect(),
         _ => Vec::new(),
     };
-    rs.assoc(Value::Keyword(kw.db_attr_tuples.clone()), Value::map(attr_tuples));
+    rs.assoc(Value::Keyword(kw.db_attr_tuples), Value::map(attr_tuples));
     (Value::map(rs), props, ref_attrs)
 }
 
@@ -298,7 +295,7 @@ fn validate_schema_key(a: &Value, k: &Keyword, v: Option<&Value>, expected: &[Va
         return Ok(());
     }
     let spec = Value::map(
-        [(a.clone(), Value::map([(Value::Keyword(k.clone()), v.clone())].into_iter().collect()))].into_iter().collect(),
+        [(a.clone(), Value::map([(Value::Keyword(*k), v.clone())].into_iter().collect()))].into_iter().collect(),
     );
     let expected_set: CljSet = expected.iter().cloned().collect();
     Err(Error::new(
@@ -310,7 +307,7 @@ fn validate_schema_key(a: &Value, k: &Keyword, v: Option<&Value>, expected: &[Va
         Value::kw_map(&[
             ("error", Value::kw("schema/validation")),
             ("attribute", a.clone()),
-            ("key", Value::Keyword(k.clone())),
+            ("key", Value::Keyword(*k)),
             ("value", v.clone()),
         ]),
     ))
@@ -320,7 +317,7 @@ fn validate_schema_key(a: &Value, k: &Keyword, v: Option<&Value>, expected: &[Va
 fn validate_schema(schema: &Value) -> Result<()> {
     let kw = kw();
     let Value::Map(schema_map) = schema else { return Ok(()) };
-    let key = |k: &Keyword| Value::Keyword(k.clone());
+    let key = |k: &Keyword| Value::Keyword(*k);
     for (a, kv) in schema_map.iter() {
         let get = |k: &Keyword| kv.get_kw(k);
         let has = |k: &Keyword| get(k).is_some();

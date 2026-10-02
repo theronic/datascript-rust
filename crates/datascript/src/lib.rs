@@ -5,6 +5,12 @@
 //! as it shows in an answer: its values, their equality and hashes (`value`, `hash`), the order of its maps and sets
 //! (`coll`), its printing and reading (`print`, `edn`), and its comparisons (`cmp`).
 
+// A value keeps its hash once it is computed, and that is all it ever changes of itself: neither its hash nor what it
+// is equal to moves, so it is a sound key, whatever clippy makes of the cell.
+#![allow(clippy::mutable_key_type)]
+// The types and argument lists are the ones DataScript's own functions have.
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
+
 pub mod built_ins;
 pub mod clj;
 pub mod cmp;

@@ -359,7 +359,7 @@ impl Ord for Attr {
             (Kind::Str, Kind::Str) => compare_str(&self.0.full, &other.0.full),
             (Kind::Str, _) => Ordering::Greater,
             (_, Kind::Str) => Ordering::Less,
-            _ => compare_named(&self.0, &other.0),
+            _ => compare_named(self.0, other.0),
         }
     }
 }

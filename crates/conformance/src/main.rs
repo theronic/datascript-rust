@@ -5,6 +5,12 @@
 //! A case is one line of EDN: a vector of steps, each a map with an `:op`. A step may name its result (`:as`), which
 //! later steps of the case use as `#r name`; `#f name` is one of the functions both sides implement alike.
 
+// A value keeps its hash once it is computed, and that is all it ever changes of itself: neither its hash nor what it
+// is equal to moves, so it is a sound key, whatever clippy makes of the cell.
+#![allow(clippy::mutable_key_type)]
+// The types and argument lists are the ones DataScript's own functions have.
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
+
 mod fns;
 mod steps;
 

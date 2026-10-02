@@ -89,7 +89,7 @@ impl Attrs {
                         Idx::V => Value::str("v"),
                         Idx::Tx => Value::str("tx"),
                     };
-                    (Value::Symbol(s.clone()), idx)
+                    (Value::Symbol(*s), idx)
                 })
                 .collect(),
         )
@@ -742,7 +742,7 @@ fn pattern_attrs(pattern: &[Value]) -> Attrs {
     let mut attrs = Attrs::default();
     for (el, idx) in pattern.iter().zip([Idx::E, Idx::A, Idx::V, Idx::Tx]) {
         if let (true, Value::Symbol(sym)) = (is_free_var(el), el) {
-            attrs.assoc(sym.clone(), idx);
+            attrs.assoc(*sym, idx);
         }
     }
     attrs
@@ -777,7 +777,7 @@ fn lookup_pattern_coll(coll: &Value, pattern: &[Value]) -> Result<Relation> {
     let mut attrs = Attrs::default();
     for (i, el) in pattern.iter().enumerate() {
         if let (true, Value::Symbol(sym)) = (is_free_var(el), el) {
-            attrs.assoc(sym.clone(), Idx::Pos(i));
+            attrs.assoc(*sym, Idx::Pos(i));
         }
     }
     Ok(Relation::rows(attrs, rows))
@@ -956,7 +956,7 @@ fn is_rule(context: &Context, clause: &Value) -> Result<bool> {
     if sym.name().starts_with('?') || matches!(sym.full(), "_" | "or" | "or-join" | "and" | "not" | "not-join") {
         return Ok(false);
     }
-    if !context.rules.contains_key(&Value::Symbol(sym.clone())) {
+    if !context.rules.contains_key(&Value::Symbol(*sym)) {
         raise!("Unknown rule '", sym, " in ", clause; {"error" => Value::kw("query/where"), "form" => clause.clone()})
     }
     Ok(true)
@@ -1140,7 +1140,7 @@ fn solve_rule(context: &Context, clause: &Value, env: &Env) -> Result<Relation> 
                 let (active, pending) = split_guards(&so_far, guards);
                 // a guard of no arguments never holds: this call repeats one it came from
                 let dead = Value::vector(vec![Value::list(vec![Value::sym("-differ?")])]);
-                if active.iter().any(|g| *g == dead) {
+                if active.contains(&dead) {
                     continue;
                 }
                 let prefix_clauses: Vec<Value> = clauses.iter().chain(&active).cloned().collect();
@@ -1177,7 +1177,7 @@ fn dynamic_lookup_attrs(db: &Db, pattern: &[Value]) -> Vec<(Symbol, Resolver)> {
         if let Value::Symbol(s) = sym {
             match out.iter_mut().find(|(x, _)| x == s) {
                 Some(entry) => entry.1 = r,
-                None => out.push((s.clone(), r)),
+                None => out.push((*s, r)),
             }
         }
     };
@@ -1209,7 +1209,7 @@ fn limit_context(context: &Context, vars: &[Value]) -> Context {
             for v in vars {
                 if let Value::Symbol(s) = v {
                     if let Some(idx) = rel.attrs.get(s) {
-                        attrs.assoc(s.clone(), idx);
+                        attrs.assoc(*s, idx);
                     }
                 }
             }
@@ -1221,7 +1221,7 @@ fn limit_context(context: &Context, vars: &[Value]) -> Context {
 
 /// `bound-vars`
 fn bound_vars(context: &Context) -> CljSet {
-    context.rels.iter().flat_map(|r| r.attrs.keys().map(|s| Value::Symbol(s.clone())).collect::<Vec<_>>()).collect()
+    context.rels.iter().flat_map(|r| r.attrs.keys().map(|s| Value::Symbol(*s)).collect::<Vec<_>>()).collect()
 }
 
 /// `clojure.set/difference`

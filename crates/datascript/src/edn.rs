@@ -637,7 +637,7 @@ fn odd_map_error(items: &[Value]) -> Error {
 }
 
 fn make_map(items: Vec<Value>) -> Result<Value> {
-    if items.len() % 2 != 0 {
+    if !items.len().is_multiple_of(2) {
         return Err(odd_map_error(&items));
     }
     let mut pairs = Vec::with_capacity(items.len() / 2);
@@ -669,7 +669,7 @@ fn parse_symbol(token: &str) -> Option<(Option<&str>, &str)> {
             if name.is_empty()
                 || name.starts_with(|c: char| c.is_ascii_digit())
                 || ns.ends_with(':')
-                || !(name == "/" || !name.contains('/'))
+                || (name != "/" && name.contains('/'))
             {
                 return None;
             }

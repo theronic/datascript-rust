@@ -390,7 +390,7 @@ impl From<Keyword> for Value {
 
 impl From<&Keyword> for Value {
     fn from(k: &Keyword) -> Value {
-        Value::Keyword(k.clone())
+        Value::Keyword(*k)
     }
 }
 
@@ -603,7 +603,7 @@ impl Value {
     /// `(get m :ns/name)`
     pub fn get_kw(&self, k: &Keyword) -> Option<&Value> {
         match self {
-            Value::Map(m) => m.get(&Value::Keyword(k.clone())),
+            Value::Map(m) => m.get(&Value::Keyword(*k)),
             _ => None,
         }
     }

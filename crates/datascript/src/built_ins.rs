@@ -476,14 +476,14 @@ fn type_of(args: &[Value]) -> Result<Value> {
 }
 
 fn hash_map(args: &[Value]) -> Result<Value> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(Error::msg(format!("No value supplied for key: {}", str_of(&args[args.len() - 1]))));
     }
     Ok(Value::map(CljMap::hash_map(args.chunks(2).map(|kv| (kv[0].clone(), kv[1].clone())))))
 }
 
 fn array_map(args: &[Value]) -> Result<Value> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(Error::msg(format!("No value supplied for key: {}", str_of(&args[args.len() - 1]))));
     }
     Ok(Value::map(CljMap::array_map(args.chunks(2).map(|kv| (kv[0].clone(), kv[1].clone())))))

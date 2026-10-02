@@ -488,7 +488,7 @@ pub fn entid<D: Searchable>(db: &D, eid: &Value) -> Result<Option<i32>> {
             Ok(datoms.first()?.map(|d| d.e))
         }
         Value::Keyword(_) => {
-            let ident = Value::Keyword(kw().db_ident.clone());
+            let ident = Value::Keyword(kw().db_ident);
             Ok(datoms(db, Index::Avet, &ident, eid, &Value::Nil, &Value::Nil)?.first()?.map(|d| d.e))
         }
         _ => raise!("Expected number or lookup ref for entity id, got ", eid;
@@ -533,7 +533,7 @@ fn slice(core: &DbCore, index: Index, from: &Bound, to: &Bound) -> Slice<Datom> 
 /// all of the other. An attribute of the other kind is an error wherever a search would compare it with one of the
 /// database's: among the datoms of its entity in EAVT, anywhere in an index that attributes lead.
 fn kind_error(core: &DbCore, index: Index, e: i32, a: &Attr) -> Option<Error> {
-    let first = core.eavt.all().first()?.a.clone();
+    let first = core.eavt.all().first()?.a;
     if first.is_keyword() == a.is_keyword() {
         return None;
     }
@@ -858,8 +858,8 @@ fn init_max_eid(schema: &Schema, eavt: &SortedSet<Datom>, avet: &SortedSet<Datom
         res = res.max(d.e);
     }
     for attr in &schema.ref_attrs {
-        let from = Bound::new(E0, Some(attr.clone()), Value::from(E0), TX0);
-        let to = Bound::new(TX0 - 1, Some(attr.clone()), Value::from(TX0 - 1), TXMAX);
+        let from = Bound::new(E0, Some(*attr), Value::from(E0), TX0);
+        let to = Bound::new(TX0 - 1, Some(*attr), Value::from(TX0 - 1), TXMAX);
         if let Some(Value::Num(v)) = last(avet, Index::Avet, &from, &to).map(|d| d.v) {
             if v > res as f64 && v <= i32::MAX as f64 {
                 res = v as i32;
