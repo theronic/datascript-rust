@@ -138,6 +138,14 @@
                   :avet    (when-not (d/is-filtered db) (mapv (juxt :a :v :e :tx) (:avet db)))})
     " " (p db)))
 
+(defn- db-digest
+  "A database in few words: its counters and two of its indexes."
+  [db]
+  [(:max-eid (db/unfiltered-db db))
+   (:max-tx (db/unfiltered-db db))
+   (mapv (juxt :e :a :v :tx) (d/datoms db :eavt))
+   (mapv (juxt :a :v :e :tx) (d/datoms db :avet))])
+
 (defn- report-line [report]
   (str "#report " (p {:tx-data (vec (:tx-data report))
                       :tempids (:tempids report)
@@ -351,8 +359,11 @@
                                 (report-line (d/transact! conn (resolve-args env tx))))
                               (catch :default e (error-line-quiet e))))
                       (:txs step))]
+        ;; and at the end every database the connection held on the way, the first of them first: a connection's
+        ;; earlier values are values still
         [(str "#conn " (p lines) " " (p (mapv (fn [r] {:tx-data (vec (:tx-data r)) :tempids (:tempids r) :tx-meta (:tx-meta r)}) @reports))
-           " " (db-line @conn))
+           " " (db-line @conn)
+           " " (p (mapv (fn [r] [(db-digest (:db-before r)) (db-digest (:db-after r))]) @reports)))
          @conn])
 
       ;; --- the runtime underneath: ClojureScript's own hash, equality, order and printing

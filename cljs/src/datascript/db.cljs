@@ -721,11 +721,18 @@
 
 (defrecord TxReport [db-before db-after tx-data tempids tx-meta])
 
+(def ^:dynamic *moving-on*
+  "Whether whoever transacts moves on from the database to the one the transaction makes, as a connection does.
+  The module then keeps the database before as the database after with the transaction undone, and not as indexes
+  of its own: a value a connection has moved on from is seldom read again, and is in the module until the garbage
+  collector finds it unreachable here. It is the same value still."
+  false)
+
 (defn transact-tx-data
   "The transaction applied to the report's database: the report of it."
   [initial-report initial-es]
   (let [db      (:db-before initial-report)
         tx-meta (:tx-meta initial-report)
         ;; the transaction's metadata stays here: the report carries it, the module has no use for it
-        [db-after tx-data tempids] (wasm/call wasm/op-with #js [db initial-es nil])]
+        [db-after tx-data tempids] (wasm/call wasm/op-with #js [db initial-es nil *moving-on*])]
     (TxReport. db db-after tx-data tempids tx-meta)))

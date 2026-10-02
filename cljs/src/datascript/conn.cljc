@@ -83,7 +83,9 @@
   (let [*report (volatile! nil)]
     (swap! conn
       (fn [db]
-        (let [r (with db tx-data tx-meta)]
+        ;; the connection moves on from db, which the module is told
+        (let [r (binding [db/*moving-on* true]
+                  (with db tx-data tx-meta))]
           (vreset! *report r)
           (:db-after r))))
     #?(:clj

@@ -93,8 +93,12 @@ The database is in the module, and a value on its way in or out is written into 
   `datascript.built-ins`, `datascript.lru`, and the experimental `datascript.query-v3`.
 - The module is told of an unreachable database value when the garbage collector's finalizers run, which is between
   tasks, and not during one. A long loop that makes a database value a turn, without yielding, keeps them all in the
-  module until it ends, and WebAssembly's memory does not shrink afterwards. One transaction of many entities is the
-  way to load much data, as it is in DataScript.
+  module until it ends, and WebAssembly's memory does not shrink afterwards. A connection's are kept small: the value
+  `transact!` moves on from stays in the module as the new value with the transaction undone, and is made whole
+  again if it is read. It costs the module some two hundred bytes, where a value kept whole, as each of a chain of
+  `with` or `db-with` is, costs some six thousand: a million small transactions in a row on a connection, with never
+  a turn of the event loop, leave the module at 200 MB. One transaction of many entities is the way to load much
+  data, as it is in DataScript.
 - A run of datoms (`datoms`, `seek-datoms`, `index-range`) is read from the module a part at a time, the first part
   at once. A filtered database's predicate is therefore asked of the first few dozen datoms of a run when the run is
   made, and not as they are read.

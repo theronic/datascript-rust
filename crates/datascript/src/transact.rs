@@ -8,7 +8,7 @@ use crate::coll::{CljMap, CljSet};
 use crate::datom::{attr_value, id_from_num, Datom, Index, TX0};
 use crate::db::{
     datoms, entid, entid_strict, fsearch, props, props_of, resolve_tuple_refs, resolved_eid, search, tuple_ref_slot,
-    validate_attr, validate_tuple, validate_val, Db, DbCore, Searchable,
+    validate_attr, validate_tuple, validate_val, Change, Db, DbCore, Searchable,
 };
 use crate::error::{Error, Result};
 use crate::named::Attr;
@@ -18,6 +18,7 @@ use crate::{message, raise};
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 /// What a transaction did: `datascript.db/TxReport`.
 #[derive(Clone)]
@@ -29,6 +30,9 @@ pub struct TxReport {
     /// Each tempid's entity id, and `:db/current-tx`'s
     pub tempids: Value,
     pub tx_meta: Value,
+    /// What it did to the indexes, in order: the datoms put in, and the ones taken out, which are not the
+    /// retractions of `tx_data` but the datoms those retracted
+    pub changes: Arc<[Change]>,
 }
 
 /// `(d/with db tx-data tx-meta)`
@@ -40,6 +44,22 @@ pub fn with(db: &Db, tx_data: &Value, tx_meta: Value) -> Result<TxReport> {
         ));
     }
     transact_tx_data(db, tx_data, tx_meta)
+}
+
+/// The most a transaction may change for the database before it to be kept as the database after, undone. A
+/// larger one leaves the two little in common, so there is little to save, and much to undo should the database
+/// before be read again.
+const SUPERSEDE_UP_TO: usize = 512;
+
+/// `with`, for whoever moves on from the database to the one the transaction makes, as a connection does: the
+/// database before then keeps its indexes as the database after's, undone (`Db::superseded_by`). It is the same
+/// value still, to anything that reads it.
+pub fn advance(db: &Db, tx_data: &Value, tx_meta: Value) -> Result<TxReport> {
+    let report = with(db, tx_data, tx_meta)?;
+    if report.changes.len() <= SUPERSEDE_UP_TO {
+        report.db_before.superseded_by(&report.db_after, report.changes.clone());
+    }
+    Ok(report)
 }
 
 /// `(d/db-with db tx-data)`
@@ -225,6 +245,8 @@ struct Report {
     /// `:db-after`, as it is so far
     db: DbCore,
     tx_data: Vec<Datom>,
+    /// What was done to `db`'s indexes so far
+    changes: Vec<Change>,
     tempids: CljMap,
     /// `::upserted-tempids`: tempids known, from an earlier run, to stand for an entity already there
     upserted_tempids: CljMap,
@@ -285,7 +307,9 @@ fn validate_datom(db: &DbCore, datom: &Datom) -> Result<()> {
 /// tuples, those tuples queued with their new values.
 fn transact_report(report: &mut Report, datom: Datom) -> Result<()> {
     validate_datom(&report.db, &datom)?;
-    report.db.apply(&datom)?;
+    if let Some(change) = report.db.apply(&datom)? {
+        report.changes.push(change);
+    }
     let sources = &props(&report.db, &datom.a).attr_tuples;
     if !sources.is_empty() {
         let sources = sources.clone();
@@ -689,7 +713,7 @@ fn transact_tx_data(db: &Db, es: &Value, tx_meta: Value) -> Result<TxReport> {
             {"error" => Value::kw("transact/syntax"), "tx-data" => es.clone()}),
     };
     let core = db.core();
-    let initial_es = assoc_auto_tempids(core, &items)?;
+    let initial_es = assoc_auto_tempids(&core, &items)?;
     let has_tuples = core.schema.has_tuples;
 
     // `retry-with-tempid` starts over, remembering what the tempid stands for
@@ -698,8 +722,9 @@ fn transact_tx_data(db: &Db, es: &Value, tx_meta: Value) -> Result<TxReport> {
     loop {
         let report = Report {
             db_before: db.clone(),
-            db: core.clone(),
+            db: (*core).clone(),
             tx_data: Vec::new(),
+            changes: Vec::new(),
             tempids: tempids.clone(),
             upserted_tempids: upserted.clone(),
             reverse_tempids: HashMap::new(),
@@ -716,6 +741,7 @@ fn transact_tx_data(db: &Db, es: &Value, tx_meta: Value) -> Result<TxReport> {
                     tx_data: report.tx_data,
                     tempids: Value::map(report.tempids),
                     tx_meta,
+                    changes: Arc::from(report.changes),
                 });
             }
             Outcome::Retry { tempid, upserted_eid, tempids: so_far } => {

@@ -10,7 +10,7 @@ use crate::sorted_set::{Slice, SortedSet};
 use crate::value::Value;
 use crate::{message, raise};
 use std::cmp::Ordering;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// A predicate over datoms: a filtered database's.
 pub type Pred = Arc<dyn Fn(&Datom) -> Result<bool> + Send + Sync>;
@@ -21,11 +21,11 @@ pub type Pred = Arc<dyn Fn(&Datom) -> Result<bool> + Send + Sync>;
 pub struct Db(pub(crate) Arc<DbRepr>);
 
 pub(crate) enum DbRepr {
-    Plain(DbCore),
+    Plain(Plain),
     Filtered(Filtered),
 }
 
-/// The database itself: `datascript.db/DB`.
+/// The database itself: `datascript.db/DB`. Its indexes, its schema and its two counters.
 #[derive(Clone)]
 pub struct DbCore {
     pub(crate) schema: Arc<Schema>,
@@ -34,7 +34,89 @@ pub struct DbCore {
     pub(crate) avet: SortedSet<Datom>,
     pub(crate) max_eid: i32,
     pub(crate) max_tx: i32,
-    pub(crate) hash: OnceLock<i32>,
+}
+
+/// A database value that is no view of another. Its schema and counters are always here. Its indexes are here too,
+/// or they are those of the database a transaction made of it, with what the transaction did undone: a connection
+/// keeps the value it moved on from that way (`Db::superseded_by`), since a value that has been replaced is seldom
+/// read again, and its own copy of the indexes' changed nodes is several kilobytes that nothing may come to free:
+/// a host of the WebAssembly module learns that a value is unreachable only when its garbage collector says so.
+pub(crate) struct Plain {
+    schema: Arc<Schema>,
+    max_eid: i32,
+    max_tx: i32,
+    hash: OnceLock<i32>,
+    indexes: Mutex<Indexes>,
+}
+
+enum Indexes {
+    Here(Arc<DbCore>),
+    /// In the database a transaction made of this one: the same indexes, with the transaction's changes undone
+    Later {
+        after: Db,
+        changes: Arc<[Change]>,
+    },
+    /// Taken away, as the value is dropped
+    Gone,
+}
+
+/// What a transaction did to the indexes, a datom at a time: the datom it put in, or the one it took out.
+#[derive(Clone)]
+pub enum Change {
+    Added(Datom),
+    Removed(Datom),
+}
+
+impl Plain {
+    fn new(core: DbCore) -> Plain {
+        Plain {
+            schema: core.schema.clone(),
+            max_eid: core.max_eid,
+            max_tx: core.max_tx,
+            hash: OnceLock::new(),
+            indexes: Mutex::new(Indexes::Here(Arc::new(core))),
+        }
+    }
+
+    fn indexes(&self) -> MutexGuard<'_, Indexes> {
+        self.indexes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Drop for Plain {
+    /// A long run of transactions on a connection leaves a chain of values, each kept by the one before it. The
+    /// chain is let go of in a loop: a value dropping the next, which drops the next, would be a call a link.
+    fn drop(&mut self) {
+        let mut link = std::mem::replace(self.indexes.get_mut().unwrap_or_else(|e| e.into_inner()), Indexes::Gone);
+        while let Indexes::Later { after, .. } = link {
+            // the next value, if nothing else holds it: its own link is taken before it is dropped
+            match Arc::try_unwrap(after.0) {
+                Ok(DbRepr::Plain(mut next)) => {
+                    link = std::mem::replace(next.indexes.get_mut().unwrap_or_else(|e| e.into_inner()), Indexes::Gone);
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
+/// A database's indexes for as long as they are read: borrowed from a transaction's own, or kept from a database
+/// value's, whose own hold on them may be given up meanwhile.
+pub enum CoreRef<'a> {
+    Here(&'a DbCore),
+    Kept(Arc<DbCore>),
+}
+
+impl std::ops::Deref for CoreRef<'_> {
+    type Target = DbCore;
+
+    #[inline]
+    fn deref(&self) -> &DbCore {
+        match self {
+            CoreRef::Here(core) => core,
+            CoreRef::Kept(core) => core,
+        }
+    }
 }
 
 /// `datascript.db/FilteredDB`: a view of a database through a predicate.
@@ -47,14 +129,20 @@ pub(crate) struct Filtered {
 /// What searching needs of a database: the indexes, and the predicate of a filtered one. A transaction searches the
 /// database it is building through this too.
 pub trait Searchable {
-    fn core(&self) -> &DbCore;
+    fn core(&self) -> CoreRef<'_>;
+    fn schema(&self) -> &Arc<Schema>;
     fn pred(&self) -> Option<&Pred>;
 }
 
 impl Searchable for DbCore {
     #[inline]
-    fn core(&self) -> &DbCore {
-        self
+    fn core(&self) -> CoreRef<'_> {
+        CoreRef::Here(self)
+    }
+
+    #[inline]
+    fn schema(&self) -> &Arc<Schema> {
+        &self.schema
     }
 
     #[inline]
@@ -64,12 +152,13 @@ impl Searchable for DbCore {
 }
 
 impl Searchable for Db {
+    fn core(&self) -> CoreRef<'_> {
+        CoreRef::Kept(self.plain().core(self))
+    }
+
     #[inline]
-    fn core(&self) -> &DbCore {
-        match &*self.0 {
-            DbRepr::Plain(core) => core,
-            DbRepr::Filtered(f) => f.unfiltered.core(),
-        }
+    fn schema(&self) -> &Arc<Schema> {
+        &self.plain().schema
     }
 
     #[inline]
@@ -348,12 +437,12 @@ impl Cursor {
 
 #[inline]
 pub(crate) fn props<'a, D: Searchable>(db: &'a D, a: &Attr) -> &'a AttrProps {
-    db.core().schema.props(a)
+    db.schema().props(a)
 }
 
 #[inline]
 pub(crate) fn props_of<'a, D: Searchable>(db: &'a D, a: &Value) -> &'a AttrProps {
-    db.core().schema.props_of(a)
+    db.schema().props_of(a)
 }
 
 // ---------------------------------------------------------------- validation
@@ -573,35 +662,36 @@ pub fn search<D: Searchable>(db: &D, e: Option<i32>, a: Option<&Attr>, v: Option
     match (e, a, v, tx) {
         (Some(e), Some(a), Some(v), Some(tx)) => {
             let b = bound(e, Some(a), Some(v), tx);
-            out = Datoms::new(slice(core, Index::Eavt, &b, &b), pred);
+            out = Datoms::new(slice(&core, Index::Eavt, &b, &b), pred);
         }
         (Some(e), Some(a), Some(v), None) => {
             out = Datoms::new(
-                slice(core, Index::Eavt, &bound(e, Some(a), Some(v), TX0), &bound(e, Some(a), Some(v), TXMAX)),
+                slice(&core, Index::Eavt, &bound(e, Some(a), Some(v), TX0), &bound(e, Some(a), Some(v), TXMAX)),
                 pred,
             );
         }
         (Some(e), Some(a), None, tx) => {
             out = Datoms::new(
-                slice(core, Index::Eavt, &bound(e, Some(a), None, TX0), &bound(e, Some(a), None, TXMAX)),
+                slice(&core, Index::Eavt, &bound(e, Some(a), None, TX0), &bound(e, Some(a), None, TXMAX)),
                 pred,
             );
             out.tx = tx;
         }
         (Some(e), None, v, tx) => {
-            out = Datoms::new(slice(core, Index::Eavt, &bound(e, None, None, TX0), &bound(e, None, None, TXMAX)), pred);
+            out =
+                Datoms::new(slice(&core, Index::Eavt, &bound(e, None, None, TX0), &bound(e, None, None, TXMAX)), pred);
             out.v = v.cloned();
             out.tx = tx;
         }
         (None, Some(a), Some(v), tx) => {
             if core.schema.props(a).index {
                 out = Datoms::new(
-                    slice(core, Index::Avet, &bound(E0, Some(a), Some(v), TX0), &bound(EMAX, Some(a), Some(v), TXMAX)),
+                    slice(&core, Index::Avet, &bound(E0, Some(a), Some(v), TX0), &bound(EMAX, Some(a), Some(v), TXMAX)),
                     pred,
                 );
             } else {
                 out = Datoms::new(
-                    slice(core, Index::Aevt, &bound(E0, Some(a), None, TX0), &bound(EMAX, Some(a), None, TXMAX)),
+                    slice(&core, Index::Aevt, &bound(E0, Some(a), None, TX0), &bound(EMAX, Some(a), None, TXMAX)),
                     pred,
                 );
                 out.v = Some(v.clone());
@@ -610,7 +700,7 @@ pub fn search<D: Searchable>(db: &D, e: Option<i32>, a: Option<&Attr>, v: Option
         }
         (None, Some(a), None, tx) => {
             out = Datoms::new(
-                slice(core, Index::Aevt, &bound(E0, Some(a), None, TX0), &bound(EMAX, Some(a), None, TXMAX)),
+                slice(&core, Index::Aevt, &bound(E0, Some(a), None, TX0), &bound(EMAX, Some(a), None, TXMAX)),
                 pred,
             );
             out.tx = tx;
@@ -627,7 +717,7 @@ pub fn search<D: Searchable>(db: &D, e: Option<i32>, a: Option<&Attr>, v: Option
             None if v.is_some() && core.schema.props(a).index => Index::Avet,
             None => Index::Aevt,
         };
-        out.failed = kind_error(core, index, e.unwrap_or(E0), a);
+        out.failed = kind_error(&core, index, e.unwrap_or(E0), a);
     }
     out
 }
@@ -718,14 +808,15 @@ pub fn datoms<D: Searchable>(db: &D, index: Index, c0: &Value, c1: &Value, c2: &
     validate_indexed(db, index, c0, c1, c2, c3)?;
     let from = components_bound(db, index, c0, c1, c2, c3, E0, TX0)?;
     let to = components_bound(db, index, c0, c1, c2, c3, EMAX, TXMAX)?;
-    bound_kind_error(db.core(), index, &from)?;
-    bound_kind_error(db.core(), index, &to)?;
-    Ok(Datoms::new(slice(db.core(), index, &from, &to), db.pred()))
+    let core = db.core();
+    bound_kind_error(&core, index, &from)?;
+    bound_kind_error(&core, index, &to)?;
+    Ok(Datoms::new(slice(&core, index, &from, &to), db.pred()))
 }
 
 fn seek_bounds<D: Searchable>(db: &D, index: Index, from: &Bound) -> Result<Datoms> {
     let to = Bound::new(EMAX, None, Value::Nil, TXMAX);
-    Ok(Datoms::new(slice(db.core(), index, from, &to), db.pred()))
+    Ok(Datoms::new(slice(&db.core(), index, from, &to), db.pred()))
 }
 
 /// `-seek-datoms`: from these components to the end of the index.
@@ -739,7 +830,7 @@ pub fn seek_datoms<D: Searchable>(
 ) -> Result<Datoms> {
     validate_indexed(db, index, c0, c1, c2, c3)?;
     let from = components_bound(db, index, c0, c1, c2, c3, E0, TX0)?;
-    bound_kind_error(db.core(), index, &from)?;
+    bound_kind_error(&db.core(), index, &from)?;
     seek_bounds(db, index, &from)
 }
 
@@ -754,9 +845,10 @@ pub fn rseek_datoms<D: Searchable>(
 ) -> Result<Datoms> {
     validate_indexed(db, index, c0, c1, c2, c3)?;
     let to = components_bound(db, index, c0, c1, c2, c3, EMAX, TXMAX)?;
-    bound_kind_error(db.core(), index, &to)?;
+    let core = db.core();
+    bound_kind_error(&core, index, &to)?;
     let from = Bound::new(E0, None, Value::Nil, TX0);
-    Ok(Datoms::new(slice(db.core(), index, &from, &to), db.pred()).reversed())
+    Ok(Datoms::new(slice(&core, index, &from, &to), db.pred()).reversed())
 }
 
 /// `-index-range`: the part of AVET between two values of an attribute.
@@ -767,7 +859,7 @@ pub fn index_range<D: Searchable>(db: &D, attr: &Value, start: &Value, end: &Val
     })?;
     let from = resolve_datom(db, &Value::Nil, attr, start, &Value::Nil, E0, TX0)?;
     let to = resolve_datom(db, &Value::Nil, attr, end, &Value::Nil, EMAX, TXMAX)?;
-    Ok(Datoms::new(slice(db.core(), Index::Avet, &from, &to), db.pred()))
+    Ok(Datoms::new(slice(&db.core(), Index::Avet, &from, &to), db.pred()))
 }
 
 /// `find-datom`: the first datom of an index with these leading components.
@@ -779,8 +871,9 @@ pub fn find_datom(db: &Db, index: Index, c0: &Value, c1: &Value, c2: &Value, c3:
     }
     let from = components_bound(db, index, c0, c1, c2, c3, E0, TX0)?;
     let to = components_bound(db, index, c0, c1, c2, c3, EMAX, TXMAX)?;
-    bound_kind_error(db.core(), index, &from)?;
-    let set = index_of(db.core(), index);
+    let core = db.core();
+    bound_kind_error(&core, index, &from)?;
+    let set = index_of(&core, index);
     let found = set.at(set.lower_bound(|d| index.cmp_bound(d, &from)));
     Ok(found.filter(|d| index.cmp_bound(d, &to) != Ordering::Greater).cloned())
 }
@@ -796,7 +889,6 @@ impl DbCore {
             avet: SortedSet::new(),
             max_eid: E0,
             max_tx: TX0,
-            hash: OnceLock::new(),
         }
     }
 
@@ -815,9 +907,9 @@ impl DbCore {
         }
     }
 
-    /// `with-datom`, less its check of uniqueness: the datom into the indexes, or its fact out of them.
-    pub(crate) fn apply(&mut self, datom: &Datom) -> Result<()> {
-        let indexing = self.schema.props(&datom.a).index;
+    /// `with-datom`, less its check of uniqueness: the datom into the indexes, or its fact out of them. What it
+    /// did to them, if anything, for whoever may have to undo it.
+    pub(crate) fn apply(&mut self, datom: &Datom) -> Result<Option<Change>> {
         if datom.added() {
             // keywords and strings do not compare: a database's attributes are all of one kind
             if let Some(first) = self.eavt.all().first() {
@@ -825,22 +917,44 @@ impl DbCore {
                     return Err(cannot_compare(&first.a, &datom.a));
                 }
             }
-            self.eavt.insert(datom.clone(), &|a, b| Index::Eavt.cmp(a, b));
-            self.aevt.insert(datom.clone(), &|a, b| Index::Aevt.cmp(a, b));
-            if indexing {
-                self.avet.insert(datom.clone(), &|a, b| Index::Avet.cmp(a, b));
-            }
+            let new = self.insert(datom);
             self.advance_max_eid(datom.e);
-            self.hash = OnceLock::new();
+            Ok(new.then(|| Change::Added(datom.clone())))
         } else if let Some(removing) = fsearch(self, datom.e, &datom.a, Some(&datom.v))? {
-            self.eavt.remove(&removing, &|a, b| Index::Eavt.cmp(a, b));
-            self.aevt.remove(&removing, &|a, b| Index::Aevt.cmp(a, b));
-            if indexing {
-                self.avet.remove(&removing, &|a, b| Index::Avet.cmp(a, b));
-            }
-            self.hash = OnceLock::new();
+            self.remove(&removing);
+            Ok(Some(Change::Removed(removing)))
+        } else {
+            Ok(None)
         }
-        Ok(())
+    }
+
+    /// A datom into the indexes. Whether it was not there.
+    fn insert(&mut self, datom: &Datom) -> bool {
+        let new = self.eavt.insert(datom.clone(), &|a, b| Index::Eavt.cmp(a, b));
+        self.aevt.insert(datom.clone(), &|a, b| Index::Aevt.cmp(a, b));
+        if self.schema.props(&datom.a).index {
+            self.avet.insert(datom.clone(), &|a, b| Index::Avet.cmp(a, b));
+        }
+        new
+    }
+
+    /// A datom out of the indexes.
+    fn remove(&mut self, datom: &Datom) {
+        self.eavt.remove(datom, &|a, b| Index::Eavt.cmp(a, b));
+        self.aevt.remove(datom, &|a, b| Index::Aevt.cmp(a, b));
+        if self.schema.props(&datom.a).index {
+            self.avet.remove(datom, &|a, b| Index::Avet.cmp(a, b));
+        }
+    }
+
+    /// The indexes as they were before a change. The counters are the caller's to put back.
+    fn undo(&mut self, change: &Change) {
+        match change {
+            Change::Added(datom) => self.remove(datom),
+            Change::Removed(datom) => {
+                self.insert(datom);
+            }
+        }
     }
 }
 
@@ -869,18 +983,90 @@ fn init_max_eid(schema: &Schema, eavt: &SortedSet<Datom>, avet: &SortedSet<Datom
     res
 }
 
+impl Plain {
+    /// The indexes: this value's own, or made again from those of the database that came after it, which this
+    /// value then holds for itself and is no longer kept by.
+    fn core(&self, me: &Db) -> Arc<DbCore> {
+        if let Indexes::Here(core) = &*self.indexes() {
+            return core.clone();
+        }
+        // from the nearest value that has its indexes, back through what each transaction on the way did
+        let mut undo: Vec<Arc<[Change]>> = Vec::new();
+        let mut at = me.clone();
+        let later = loop {
+            let next = match &*at.plain().indexes() {
+                Indexes::Here(core) => break core.clone(),
+                Indexes::Later { after, changes } => {
+                    undo.push(changes.clone());
+                    after.clone()
+                }
+                Indexes::Gone => unreachable!("a database that is being dropped is not read"),
+            };
+            at = next;
+        };
+        let mut core = (*later).clone();
+        for changes in undo.iter().rev() {
+            for change in changes.iter().rev() {
+                core.undo(change);
+            }
+        }
+        core.schema = self.schema.clone();
+        core.max_eid = self.max_eid;
+        core.max_tx = self.max_tx;
+        let core = Arc::new(core);
+        // the link to the later value is dropped outside the lock: it may be the last hold on a chain of them
+        let before = std::mem::replace(&mut *self.indexes(), Indexes::Here(core.clone()));
+        drop(before);
+        core
+    }
+}
+
 impl Db {
-    fn plain(core: DbCore) -> Db {
-        Db(Arc::new(DbRepr::Plain(core)))
+    fn plain_of(core: DbCore) -> Db {
+        Db(Arc::new(DbRepr::Plain(Plain::new(core))))
+    }
+
+    /// The value itself, or the one a filtered database is a view of.
+    #[inline]
+    fn plain(&self) -> &Plain {
+        match &*self.0 {
+            DbRepr::Plain(plain) => plain,
+            DbRepr::Filtered(f) => f.unfiltered.plain(),
+        }
+    }
+
+    /// Gives up this value's indexes for those of `after`, the database a transaction made of it, and what the
+    /// transaction did (`TxReport::changes`): they are made again if this value is ever read, by undoing that. What
+    /// a connection does with the value it moves on from. Nothing that reads the value tells the difference, but
+    /// by how long the first read after takes.
+    pub fn superseded_by(&self, after: &Db, changes: Arc<[Change]>) {
+        let (DbRepr::Plain(plain), DbRepr::Plain(_)) = (&*self.0, &*after.0) else { return };
+        if self.ptr_eq(after) {
+            return;
+        }
+        // the indexes are dropped outside the lock
+        let before = {
+            let mut indexes = plain.indexes();
+            match &*indexes {
+                Indexes::Here(_) => std::mem::replace(&mut *indexes, Indexes::Later { after: after.clone(), changes }),
+                _ => return,
+            }
+        };
+        drop(before);
+    }
+
+    /// Whether this value holds its indexes itself.
+    pub fn holds_indexes(&self) -> bool {
+        matches!(&*self.plain().indexes(), Indexes::Here(_))
     }
 
     pub(crate) fn from_core(core: DbCore) -> Db {
-        Db::plain(core)
+        Db::plain_of(core)
     }
 
     /// `(empty-db schema)`: the schema is a map or `nil`.
     pub fn empty(schema: Value) -> Result<Db> {
-        Ok(Db::plain(DbCore::new(Arc::new(Schema::new(schema)?))))
+        Ok(Db::plain_of(DbCore::new(Arc::new(Schema::new(schema)?))))
     }
 
     /// `(init-db datoms schema)`: a database of these datoms, taken as they are.
@@ -902,7 +1088,7 @@ impl Db {
         let aevt = SortedSet::from_sorted(by_aevt);
         let avet = SortedSet::from_sorted(by_avet);
         let max_eid = init_max_eid(&schema, &eavt, &avet);
-        Ok(Db::plain(DbCore { schema, eavt, aevt, avet, max_eid, max_tx, hash: OnceLock::new() }))
+        Ok(Db::plain_of(DbCore { schema, eavt, aevt, avet, max_eid, max_tx }))
     }
 
     /// `restore-db`: a database of indexes already in order, as a serialized one is read back.
@@ -914,14 +1100,13 @@ impl Db {
         max_eid: i32,
         max_tx: i32,
     ) -> Db {
-        Db::plain(DbCore {
+        Db::plain_of(DbCore {
             schema,
             eavt: SortedSet::from_sorted(eavt),
             aevt: SortedSet::from_sorted(aevt),
             avet: SortedSet::from_sorted(avet),
             max_eid,
             max_tx,
-            hash: OnceLock::new(),
         })
     }
 
@@ -934,10 +1119,9 @@ impl Db {
         if self.is_filtered() {
             return Err(Error::msg("-assoc is not supported on FilteredDB"));
         }
-        let mut core = self.core().clone();
+        let mut core = (*self.core()).clone();
         core.schema = Arc::new(Schema::unchecked(schema));
-        core.hash = OnceLock::new();
-        Ok(Db::plain(core))
+        Ok(Db::plain_of(core))
     }
 
     /// `(empty db)`: no datoms, the same schema.
@@ -945,7 +1129,7 @@ impl Db {
         if self.is_filtered() {
             return Err(Error::msg("-empty is not supported on FilteredDB"));
         }
-        Ok(Db::plain(DbCore::new(self.core().schema.clone())))
+        Ok(Db::plain_of(DbCore::new(self.plain().schema.clone())))
     }
 
     /// `(filter db pred)`: a view of the database with only the datoms `(pred db datom)` holds for. A view of a
@@ -986,26 +1170,26 @@ impl Db {
 
     /// `(:schema db)`: the schema as given, a map or `nil`.
     pub fn schema_value(&self) -> Value {
-        self.core().schema.value.clone()
+        self.plain().schema.value.clone()
     }
 
     /// `(:rschema db)`
     pub fn rschema_value(&self) -> Value {
-        self.core().schema.rschema.clone()
+        self.plain().schema.rschema.clone()
     }
 
     pub fn schema(&self) -> &Arc<Schema> {
-        &self.core().schema
+        &self.plain().schema
     }
 
     /// `(:max-eid db)`
     pub fn max_eid(&self) -> i32 {
-        self.core().max_eid
+        self.plain().max_eid
     }
 
     /// `(:max-tx db)`
     pub fn max_tx(&self) -> i32 {
-        self.core().max_tx
+        self.plain().max_tx
     }
 
     /// `(count db)`: its datoms, less those a filter leaves out.
@@ -1023,7 +1207,7 @@ impl Db {
 
     /// A whole index, as `(:eavt db)`; of a filtered database, the unfiltered index, as in ClojureScript.
     pub fn index(&self, index: Index) -> Datoms {
-        Datoms::new(index_of(self.core(), index).all(), None)
+        Datoms::new(index_of(&self.core(), index).all(), None)
     }
 
     pub(crate) fn for_each_datom(&self, mut f: impl FnMut(&Datom)) {
@@ -1038,11 +1222,12 @@ impl Db {
         if self.ptr_eq(other) {
             return true;
         }
-        if self.core().schema.value != other.core().schema.value {
+        if self.plain().schema.value != other.plain().schema.value {
             return false;
         }
         if self.pred().is_none() && other.pred().is_none() {
-            let (a, b) = (&self.core().eavt, &other.core().eavt);
+            let (mine, theirs) = (self.core(), other.core());
+            let (a, b) = (&mine.eavt, &theirs.eavt);
             return a.ptr_eq(b) || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equiv(y)));
         }
         match (self.all().to_vec(), other.all().to_vec()) {
@@ -1056,10 +1241,10 @@ impl Db {
         let compute = || {
             let mut hashes = Vec::new();
             self.for_each_datom(|d| hashes.push(d.cljs_hash()));
-            hash_combine(self.core().schema.value.cljs_hash(), hash_unordered(hashes))
+            hash_combine(self.plain().schema.value.cljs_hash(), hash_unordered(hashes))
         };
         match &*self.0 {
-            DbRepr::Plain(core) => *core.hash.get_or_init(compute),
+            DbRepr::Plain(plain) => *plain.hash.get_or_init(compute),
             DbRepr::Filtered(f) => *f.hash.get_or_init(compute),
         }
     }
@@ -1184,4 +1369,87 @@ pub fn diff(a: &Db, b: &Db) -> Result<Value> {
     only_b.extend(ys[j..].iter().map(datom));
     let not_empty = |v: Vec<Value>| if v.is_empty() { Value::Nil } else { Value::vector(v) };
     Ok(Value::vector(vec![not_empty(only_a), not_empty(only_b), not_empty(both)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edn::read_string;
+    use crate::print::pr_str;
+    use crate::transact::{advance, with};
+
+    fn tx(i: usize) -> Value {
+        read_string(&format!(
+            r#"[[:db/add {} :n {}] [:db/add {} :name "n{}"] [:db/retract {} :name "n{}"]]"#,
+            1 + i % 50,
+            i,
+            1 + i % 7,
+            i,
+            1 + i % 7,
+            i.saturating_sub(7)
+        ))
+        .unwrap()
+    }
+
+    fn digest(db: &Db) -> String {
+        let datoms = db.datoms(Index::Eavt, &[]).unwrap().to_vec().unwrap();
+        let avet = db.datoms(Index::Avet, &[]).unwrap().to_vec().unwrap();
+        format!("{} {} {:?} {:?}", db.max_eid(), db.max_tx(), datoms.iter().map(pr).collect::<Vec<_>>(), avet.len())
+    }
+
+    fn pr(d: &Datom) -> String {
+        format!("{} {} {} {}", d.e, d.a.full(), pr_str(&d.v), d.tx())
+    }
+
+    /// A value a connection moved on from is the value it was, whenever it is read, and however far the
+    /// connection has moved on since.
+    #[test]
+    fn a_superseded_database_reads_as_it_did() {
+        let schema = read_string("{:name {:db/index true}}").unwrap();
+        let mut plain = vec![Db::empty(schema.clone()).unwrap()];
+        let mut moved = vec![Db::empty(schema).unwrap()];
+        for i in 0..400 {
+            plain.push(with(plain.last().unwrap(), &tx(i), Value::Nil).unwrap().db_after);
+            moved.push(advance(moved.last().unwrap(), &tx(i), Value::Nil).unwrap().db_after);
+        }
+        assert!(moved[..400].iter().all(|db| !db.holds_indexes()));
+        assert!(moved[400].holds_indexes());
+        // the oldest first, which is the longest way back; then some in the middle; then all of them
+        for i in [0, 1, 399, 200, 37, 201] {
+            assert_eq!(digest(&plain[i]), digest(&moved[i]), "version {i}");
+            assert!(moved[i].holds_indexes());
+        }
+        for (i, (a, b)) in plain.iter().zip(&moved).enumerate() {
+            assert_eq!(digest(a), digest(b), "version {i}");
+            assert!(a.equiv(b));
+            assert_eq!(a.cljs_hash(), b.cljs_hash());
+        }
+    }
+
+    /// A value that is read again may be moved on from again.
+    #[test]
+    fn a_database_moved_on_from_twice() {
+        let db0 = Db::empty(Value::Nil).unwrap();
+        let a = advance(&db0, &tx(1), Value::Nil).unwrap().db_after;
+        assert!(!db0.holds_indexes());
+        let b = advance(&db0, &tx(2), Value::Nil).unwrap().db_after;
+        assert_eq!(db0.count().unwrap(), 0);
+        assert_eq!(digest(&a), digest(&with(&Db::empty(Value::Nil).unwrap(), &tx(1), Value::Nil).unwrap().db_after));
+        assert_eq!(digest(&b), digest(&with(&Db::empty(Value::Nil).unwrap(), &tx(2), Value::Nil).unwrap().db_after));
+    }
+
+    /// A long chain of values, each kept by the one before, is dropped without a call for each.
+    #[test]
+    fn a_long_chain_is_dropped_in_a_loop() {
+        let first = Db::empty(Value::Nil).unwrap();
+        let mut db = first.clone();
+        for i in 0..200_000 {
+            db = advance(&db, &read_string(&format!("[[:db/add 1 :n {i}]]")).unwrap(), Value::Nil).unwrap().db_after;
+        }
+        assert_eq!(db.count().unwrap(), 1);
+        drop(db);
+        // `first` alone holds the chain now, and reading it walks all of it
+        assert_eq!(first.count().unwrap(), 0);
+        drop(first);
+    }
 }

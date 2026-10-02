@@ -46,5 +46,5 @@ pub use error::{Error, Result};
 pub use named::{Attr, Keyword, Symbol};
 pub use pull_api::{pull, pull_many};
 pub use query::q;
-pub use transact::{db_with, with, TxReport};
+pub use transact::{advance, db_with, with, TxReport};
 pub use value::Value;

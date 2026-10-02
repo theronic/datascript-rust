@@ -4,7 +4,7 @@ use crate::coll::CljMap;
 use crate::datom::Datom;
 use crate::db::Db;
 use crate::error::Result;
-use crate::transact::{with, TxReport};
+use crate::transact::{advance, TxReport};
 use crate::value::Value;
 use std::sync::{Arc, Mutex};
 
@@ -57,7 +57,8 @@ impl Conn {
     pub fn transact(&self, tx_data: &Value, tx_meta: Value) -> Result<TxReport> {
         let report = {
             let mut inner = self.lock();
-            let report = with(&inner.db, tx_data, tx_meta)?;
+            // the database the connection moves on from keeps its indexes as the new one's, undone
+            let report = advance(&inner.db, tx_data, tx_meta)?;
             inner.db = report.db_after.clone();
             report
         };
@@ -84,7 +85,14 @@ impl Conn {
                 .map(|d| Datom::with_added(d.e, d.a, d.v.clone(), d.tx(), false))
                 .collect();
             tx_data.extend(db.all().to_vec()?);
-            let report = TxReport { db_before: before, db_after: db.clone(), tx_data, tempids: Value::Nil, tx_meta };
+            let report = TxReport {
+                db_before: before,
+                db_after: db.clone(),
+                tx_data,
+                tempids: Value::Nil,
+                tx_meta,
+                changes: Arc::from([]),
+            };
             for listener in listeners {
                 listener(&report)?;
             }

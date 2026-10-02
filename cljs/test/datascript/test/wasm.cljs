@@ -181,6 +181,33 @@
     (is (= "#datascript/DB {:schema nil, :datoms [[1 :name \"Ivan\" 536870913]]}" (pr-str db1)))
     (is (= db1 (cljs.reader/read-string (pr-str db1))))))
 
+(deftest test-a-connection-moves-on
+  (testing "the values a connection moved on from are the values they were, however far it has moved on since"
+    (let [schema  {:name {:db/index true}}
+          tx      (fn [i] [[:db/add (inc (mod i 10)) :n i]
+                           {:db/id (inc (mod i 7)) :name (str "n" i)}
+                           [:db/retract (inc (mod i 7)) :name (str "n" (- i 7))]])
+          conn    (d/create-conn schema)
+          reports (atom [])
+          _       (d/listen! conn :test #(swap! reports conj %))
+          _       (dotimes [i 300] (d/transact! conn (tx i)))
+          ;; the same transactions, each on the value before and none moved on from
+          values  (vec (reductions (fn [db i] (d/db-with db (tx i))) (d/empty-db schema) (range 300)))
+          datoms  (fn [db] [(mapv (juxt :e :a :v :tx) (d/datoms db :eavt))
+                            (mapv (juxt :e :a :v :tx) (d/datoms db :avet))
+                            (:max-eid db) (:max-tx db)])]
+      (is (= 300 (count @reports)))
+      (is (= (datoms (values 0)) (datoms (:db-before (first @reports)))))
+      (is (= (datoms (values 150)) (datoms (:db-after (nth @reports 149)))))
+      (is (every? true? (map (fn [r before after]
+                               (and (= (datoms before) (datoms (:db-before r)))
+                                 (= (datoms after) (datoms (:db-after r)))))
+                          @reports values (rest values))))
+      (is (= (values 37) (:db-before (nth @reports 37))))
+      (is (= "n35" (:name (d/entity (:db-before (nth @reports 37)) 1))))
+      (is (= #{[1]} (d/q '[:find ?e :where [?e :name "n35"]] (:db-before (nth @reports 37)))))
+      (is (= (last values) @conn)))))
+
 (defn- settle
   "Calls back once the garbage collector has run and what it frees has been let go of."
   [rounds done]

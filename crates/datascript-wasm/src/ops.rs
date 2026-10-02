@@ -14,7 +14,9 @@ use std::sync::Arc;
 pub const EMPTY_DB: u32 = 1;
 /// `[datoms schema]` → db
 pub const INIT_DB: u32 = 2;
-/// `[db tx-data tx-meta]` → `[db-after tx-data tempids]`
+/// `[db tx-data tx-meta moving-on?]` → `[db-after tx-data tempids]`. A host that moves on from `db` to the
+/// database after, as a connection does, says so: `db` then keeps its indexes as the new database's, undone, and is
+/// the same value still (`datascript::advance`).
 pub const WITH: u32 = 3;
 /// `[db schema]` → db
 pub const WITH_SCHEMA: u32 = 4;
@@ -275,7 +277,12 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
             Value::Db(Db::init(datoms, arg(args, 1).clone())?)
         }
         WITH => {
-            let report = datascript::with(&db_arg(args, 0)?, arg(args, 1), arg(args, 2).clone())?;
+            let (db, tx_data, tx_meta) = (db_arg(args, 0)?, arg(args, 1), arg(args, 2).clone());
+            let report = if arg(args, 3).truthy() {
+                datascript::advance(&db, tx_data, tx_meta)?
+            } else {
+                datascript::with(&db, tx_data, tx_meta)?
+            };
             vector![Value::Db(report.db_after), datoms_value(report.tx_data), report.tempids]
         }
         WITH_SCHEMA => Value::Db(db_arg(args, 0)?.with_schema(arg(args, 1).clone())?),

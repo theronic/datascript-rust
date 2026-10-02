@@ -159,6 +159,23 @@ pub fn db_line(db: &Db) -> Result<String> {
     Ok(format!("#db {} {}", pr_str(&Value::map(m)), pr_str(&Value::Db(db.clone()))))
 }
 
+/// A database in few words: its counters and two of its indexes.
+fn db_digest(db: &Db) -> Result<Value> {
+    let unfiltered = db.unfiltered();
+    let eavt = db.datoms(Index::Eavt, &[])?.to_vec()?;
+    let avet = db.datoms(Index::Avet, &[])?.to_vec()?;
+    let row = |d: &Datom, v_first: bool| {
+        let (e, a, v, tx) = (Value::from(d.e), d.a_value(), d.v.clone(), Value::from(d.tx()));
+        Value::vector(if v_first { vec![a, v, e, tx] } else { vec![e, a, v, tx] })
+    };
+    Ok(Value::vector(vec![
+        Value::from(unfiltered.max_eid()),
+        Value::from(unfiltered.max_tx()),
+        Value::vector(eavt.iter().map(|d| row(d, false)).collect()),
+        Value::vector(avet.iter().map(|d| row(d, true)).collect()),
+    ]))
+}
+
 pub fn report_line(report: &datascript::TxReport) -> Result<String> {
     let mut m = CljMap::new();
     m.assoc(kwv("tx-data"), datoms_vector(report.tx_data.clone()));
@@ -545,7 +562,21 @@ fn run_step(env: &Env, step: &Value) -> Result<(String, Value)> {
                 })
                 .collect();
             let db = conn.db();
-            (format!("#conn {} {} {}", p(&Value::vector(lines)), p(&Value::vector(seen)), db_line(&db)?), Value::Db(db))
+            // and at the end every database the connection held on the way, the first of them first
+            let mut history = Vec::new();
+            for r in reports.lock().unwrap().iter() {
+                history.push(Value::vector(vec![db_digest(&r.db_before)?, db_digest(&r.db_after)?]));
+            }
+            (
+                format!(
+                    "#conn {} {} {} {}",
+                    p(&Value::vector(lines)),
+                    p(&Value::vector(seen)),
+                    db_line(&db)?,
+                    p(&Value::vector(history))
+                ),
+                Value::Db(db),
+            )
         }
 
         // --- the runtime underneath: ClojureScript's own hash, equality, order and printing
