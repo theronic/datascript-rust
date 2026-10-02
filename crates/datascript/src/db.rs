@@ -10,6 +10,7 @@ use crate::sorted_set::{Slice, SortedSet};
 use crate::value::Value;
 use crate::{message, raise};
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// A predicate over datoms: a filtered database's.
@@ -47,6 +48,8 @@ pub(crate) struct Plain {
     max_tx: i32,
     hash: OnceLock<i32>,
     indexes: Mutex<Indexes>,
+    /// How many times the indexes were made again: a place in them (`Cursor::place`) is good for one making
+    epoch: AtomicU32,
 }
 
 enum Indexes {
@@ -75,6 +78,7 @@ impl Plain {
             max_tx: core.max_tx,
             hash: OnceLock::new(),
             indexes: Mutex::new(Indexes::Here(Arc::new(core))),
+            epoch: AtomicU32::new(0),
         }
     }
 
@@ -175,6 +179,8 @@ impl Searchable for Db {
 #[derive(Clone)]
 pub struct Datoms {
     slice: Slice<Datom>,
+    /// The index the run is of
+    index: Index,
     rev: bool,
     v: Option<Value>,
     tx: Option<i32>,
@@ -184,12 +190,12 @@ pub struct Datoms {
 }
 
 impl Datoms {
-    fn new(slice: Slice<Datom>, pred: Option<&Pred>) -> Datoms {
-        Datoms { slice, rev: false, v: None, tx: None, pred: pred.cloned(), failed: None }
+    fn new(slice: Slice<Datom>, index: Index, pred: Option<&Pred>) -> Datoms {
+        Datoms { slice, index, rev: false, v: None, tx: None, pred: pred.cloned(), failed: None }
     }
 
     pub fn empty() -> Datoms {
-        Datoms { slice: Slice::empty(), rev: false, v: None, tx: None, pred: None, failed: None }
+        Datoms { slice: Slice::empty(), index: Index::Eavt, rev: false, v: None, tx: None, pred: None, failed: None }
     }
 
     #[inline]
@@ -343,12 +349,27 @@ impl Datoms {
     }
 
     /// A cursor at a place one of these datoms' cursors was at (`Cursor::place`): where a caller that read a part
-    /// and kept the place reads on, with the same datoms found again.
+    /// and kept the place reads on, with the same datoms found again in the same database. The place is one in the
+    /// index as it was built: a database whose indexes were made again since (`Db::epoch`) is read on from the last
+    /// datom read, with `cursor_after`.
     pub fn cursor_at(&self, place: &[u16]) -> Result<Cursor> {
         let pos = crate::sorted_set::Pos::from_path(place)
             .filter(|pos| self.slice.has(pos))
             .ok_or_else(|| Error::msg("datascript: no such place in the index"))?;
         Ok(Cursor { pos, done: false })
+    }
+
+    /// A cursor after a datom of the run, in the direction the run is read in: where a caller that kept the last
+    /// datom it read reads on, however the index is built.
+    pub fn cursor_after(&self, last: &Datom) -> Cursor {
+        let index = self.index;
+        let pos = if self.rev {
+            // backwards from the datom itself, which is left out
+            self.slice.lower_bound(|d| index.cmp(d, last))
+        } else {
+            self.slice.upper_bound(|d| index.cmp(d, last))
+        };
+        Cursor { pos, done: false }
     }
 
     /// The next datoms from a cursor, at most `n`, which moves the cursor past them. An empty answer is the end.
@@ -662,24 +683,29 @@ pub fn search<D: Searchable>(db: &D, e: Option<i32>, a: Option<&Attr>, v: Option
     match (e, a, v, tx) {
         (Some(e), Some(a), Some(v), Some(tx)) => {
             let b = bound(e, Some(a), Some(v), tx);
-            out = Datoms::new(slice(&core, Index::Eavt, &b, &b), pred);
+            out = Datoms::new(slice(&core, Index::Eavt, &b, &b), Index::Eavt, pred);
         }
         (Some(e), Some(a), Some(v), None) => {
             out = Datoms::new(
                 slice(&core, Index::Eavt, &bound(e, Some(a), Some(v), TX0), &bound(e, Some(a), Some(v), TXMAX)),
+                Index::Eavt,
                 pred,
             );
         }
         (Some(e), Some(a), None, tx) => {
             out = Datoms::new(
                 slice(&core, Index::Eavt, &bound(e, Some(a), None, TX0), &bound(e, Some(a), None, TXMAX)),
+                Index::Eavt,
                 pred,
             );
             out.tx = tx;
         }
         (Some(e), None, v, tx) => {
-            out =
-                Datoms::new(slice(&core, Index::Eavt, &bound(e, None, None, TX0), &bound(e, None, None, TXMAX)), pred);
+            out = Datoms::new(
+                slice(&core, Index::Eavt, &bound(e, None, None, TX0), &bound(e, None, None, TXMAX)),
+                Index::Eavt,
+                pred,
+            );
             out.v = v.cloned();
             out.tx = tx;
         }
@@ -687,11 +713,13 @@ pub fn search<D: Searchable>(db: &D, e: Option<i32>, a: Option<&Attr>, v: Option
             if core.schema.props(a).index {
                 out = Datoms::new(
                     slice(&core, Index::Avet, &bound(E0, Some(a), Some(v), TX0), &bound(EMAX, Some(a), Some(v), TXMAX)),
+                    Index::Avet,
                     pred,
                 );
             } else {
                 out = Datoms::new(
                     slice(&core, Index::Aevt, &bound(E0, Some(a), None, TX0), &bound(EMAX, Some(a), None, TXMAX)),
+                    Index::Aevt,
                     pred,
                 );
                 out.v = Some(v.clone());
@@ -701,12 +729,13 @@ pub fn search<D: Searchable>(db: &D, e: Option<i32>, a: Option<&Attr>, v: Option
         (None, Some(a), None, tx) => {
             out = Datoms::new(
                 slice(&core, Index::Aevt, &bound(E0, Some(a), None, TX0), &bound(EMAX, Some(a), None, TXMAX)),
+                Index::Aevt,
                 pred,
             );
             out.tx = tx;
         }
         (None, None, v, tx) => {
-            out = Datoms::new(core.eavt.all(), pred);
+            out = Datoms::new(core.eavt.all(), Index::Eavt, pred);
             out.v = v.cloned();
             out.tx = tx;
         }
@@ -811,12 +840,12 @@ pub fn datoms<D: Searchable>(db: &D, index: Index, c0: &Value, c1: &Value, c2: &
     let core = db.core();
     bound_kind_error(&core, index, &from)?;
     bound_kind_error(&core, index, &to)?;
-    Ok(Datoms::new(slice(&core, index, &from, &to), db.pred()))
+    Ok(Datoms::new(slice(&core, index, &from, &to), index, db.pred()))
 }
 
 fn seek_bounds<D: Searchable>(db: &D, index: Index, from: &Bound) -> Result<Datoms> {
     let to = Bound::new(EMAX, None, Value::Nil, TXMAX);
-    Ok(Datoms::new(slice(&db.core(), index, from, &to), db.pred()))
+    Ok(Datoms::new(slice(&db.core(), index, from, &to), index, db.pred()))
 }
 
 /// `-seek-datoms`: from these components to the end of the index.
@@ -848,7 +877,7 @@ pub fn rseek_datoms<D: Searchable>(
     let core = db.core();
     bound_kind_error(&core, index, &to)?;
     let from = Bound::new(E0, None, Value::Nil, TX0);
-    Ok(Datoms::new(slice(&core, index, &from, &to), db.pred()).reversed())
+    Ok(Datoms::new(slice(&core, index, &from, &to), index, db.pred()).reversed())
 }
 
 /// `-index-range`: the part of AVET between two values of an attribute.
@@ -859,7 +888,7 @@ pub fn index_range<D: Searchable>(db: &D, attr: &Value, start: &Value, end: &Val
     })?;
     let from = resolve_datom(db, &Value::Nil, attr, start, &Value::Nil, E0, TX0)?;
     let to = resolve_datom(db, &Value::Nil, attr, end, &Value::Nil, EMAX, TXMAX)?;
-    Ok(Datoms::new(slice(&db.core(), Index::Avet, &from, &to), db.pred()))
+    Ok(Datoms::new(slice(&db.core(), Index::Avet, &from, &to), Index::Avet, db.pred()))
 }
 
 /// `find-datom`: the first datom of an index with these leading components.
@@ -1016,6 +1045,7 @@ impl Plain {
         let core = Arc::new(core);
         // the link to the later value is dropped outside the lock: it may be the last hold on a chain of them
         let before = std::mem::replace(&mut *self.indexes(), Indexes::Here(core.clone()));
+        self.epoch.fetch_add(1, AtomicOrdering::Relaxed);
         drop(before);
         core
     }
@@ -1058,6 +1088,13 @@ impl Db {
     /// Whether this value holds its indexes itself.
     pub fn holds_indexes(&self) -> bool {
         matches!(&*self.plain().indexes(), Indexes::Here(_))
+    }
+
+    /// How many times this value's indexes were made again after it gave them up. A place in a run of its datoms
+    /// (`Cursor::place`) is a place in the indexes as they were built when it was taken, and is good while this
+    /// number is what it was then.
+    pub fn epoch(&self) -> u32 {
+        self.plain().epoch.load(AtomicOrdering::Relaxed)
     }
 
     pub(crate) fn from_core(core: DbCore) -> Db {
@@ -1202,12 +1239,12 @@ impl Db {
 
     /// Every datom, in EAVT order.
     pub fn all(&self) -> Datoms {
-        Datoms::new(self.core().eavt.all(), self.pred())
+        Datoms::new(self.core().eavt.all(), Index::Eavt, self.pred())
     }
 
     /// A whole index, as `(:eavt db)`; of a filtered database, the unfiltered index, as in ClojureScript.
     pub fn index(&self, index: Index) -> Datoms {
-        Datoms::new(index_of(&self.core(), index).all(), None)
+        Datoms::new(index_of(&self.core(), index).all(), index, None)
     }
 
     pub(crate) fn for_each_datom(&self, mut f: impl FnMut(&Datom)) {
@@ -1436,6 +1473,52 @@ mod tests {
         assert_eq!(db0.count().unwrap(), 0);
         assert_eq!(digest(&a), digest(&with(&Db::empty(Value::Nil).unwrap(), &tx(1), Value::Nil).unwrap().db_after));
         assert_eq!(digest(&b), digest(&with(&Db::empty(Value::Nil).unwrap(), &tx(2), Value::Nil).unwrap().db_after));
+    }
+
+    /// A run of datoms read in parts is read on from the last datom read, when the database's indexes were made
+    /// again between two parts and a place in them is a place no more.
+    #[test]
+    fn a_run_is_read_on_after_its_database_was_moved_on_from() {
+        let schema = read_string("{:name {:db/index true}}").unwrap();
+        let mut db = Db::empty(schema).unwrap();
+        for i in 0..300 {
+            db = with(&db, &tx(i), Value::Nil).unwrap().db_after;
+        }
+        for index in [Index::Eavt, Index::Aevt, Index::Avet] {
+            for reverse in [false, true] {
+                let run = |db: &Db| {
+                    let run = db.datoms(index, &[]).unwrap();
+                    if reverse {
+                        run.reversed()
+                    } else {
+                        run
+                    }
+                };
+                let whole: Vec<String> = run(&db).to_vec().unwrap().iter().map(pr).collect();
+                // a part, then the database is moved on from, by transactions that change the very leaves read
+                let first = run(&db);
+                let mut cursor = first.cursor();
+                let mut read = first.next_chunk(&mut cursor, 7).unwrap();
+                let epoch = db.epoch();
+                let mut head = db.clone();
+                for i in 300..420 {
+                    head = advance(&head, &tx(i), Value::Nil).unwrap().db_after;
+                }
+                assert!(!db.holds_indexes());
+                // the rest, from the last datom read: the indexes are made again, and are built another way
+                let rest = run(&db);
+                assert_ne!(db.epoch(), epoch);
+                let mut cursor = rest.cursor_after(read.last().unwrap());
+                loop {
+                    let part = rest.next_chunk(&mut cursor, 5).unwrap();
+                    if part.is_empty() {
+                        break;
+                    }
+                    read.extend(part);
+                }
+                assert_eq!(whole, read.iter().map(pr).collect::<Vec<_>>(), "{index:?} reverse {reverse}");
+            }
+        }
     }
 
     /// A long chain of values, each kept by the one before, is dropped without a call for each.

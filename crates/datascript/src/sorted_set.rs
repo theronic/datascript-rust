@@ -550,6 +550,16 @@ impl<T: Clone> Slice<T> {
         self.set.has(pos)
     }
 
+    /// The place, in the set this run is of, of the first element that is not less than a bound.
+    pub fn lower_bound(&self, f: impl Fn(&T) -> Ordering) -> Pos {
+        self.set.lower_bound(f)
+    }
+
+    /// The place of the first element greater than a bound.
+    pub fn upper_bound(&self, f: impl Fn(&T) -> Ordering) -> Pos {
+        self.set.upper_bound(f)
+    }
+
     /// The run from a place in it on: where an iteration that stopped goes on.
     pub fn iter_from(&self, from: Pos) -> Iter<'_, T> {
         Iter::new(&self.set, from.max(self.from), self.to)

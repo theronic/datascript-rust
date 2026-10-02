@@ -30,15 +30,16 @@ pub const Q: u32 = 7;
 pub const PULL: u32 = 8;
 /// `[db pattern eids visitor]` → vector
 pub const PULL_MANY: u32 = 9;
-/// `[db index c0 c1 c2 c3 n reverse? place]` → `[datoms place]`: at most `n` datoms, as a run (`codec::DATOMS`), from
-/// the start or from the place a call before answered; and the place to read on from, `nil` at the end. A place is
-/// good for the same arguments again, and holds nothing in the module.
+/// `[db index c0 c1 c2 c3 n reverse? place after]` → `[datoms place]`: at most `n` datoms, as a run
+/// (`codec::DATOMS`), from the start, or on from a read before: `place` is the place that read answered, and `after`
+/// the last datom it answered. The place to read on from is answered, `nil` at the end. Nothing is held in the
+/// module for a run that is read in parts.
 pub const DATOMS: u32 = 10;
 pub const SEEK_DATOMS: u32 = 11;
 pub const RSEEK_DATOMS: u32 = 12;
-/// `[db attr start end n reverse? place]` → `[datoms place]`
+/// `[db attr start end n reverse? place after]` → `[datoms place]`
 pub const INDEX_RANGE: u32 = 13;
-/// `[db e a v tx n reverse? place]` → `[datoms place]`: `-search`, each component `nil` when open
+/// `[db e a v tx n reverse? place after]` → `[datoms place]`: `-search`, each component `nil` when open
 pub const SEARCH: u32 = 14;
 /// `[read arguments]` → how many datoms a read (`DATOMS` … `SEARCH`) with those arguments has from its place on: a
 /// run counted where it is, and not read to be counted
@@ -122,18 +123,27 @@ fn datoms_value(datoms: Vec<Datom>) -> Value {
     Value::vector(datoms.into_iter().map(|d| Value::Datom(Arc::new(d))).collect())
 }
 
-/// Writes `[datoms place]`: at most `n` of a run of datoms, from its start or from a place answered before, and
-/// the place to read on from when there may be more.
-fn write_chunk(w: &mut Writer, datoms: Datoms, n: &Value, reverse: &Value, place: &Value) -> Result<()> {
+/// Where a run of datoms is read on from: its start; the place a read before answered, while the database's
+/// indexes are built as they were then; or after the last datom that read answered, however they are built now.
+fn cursor_of(datoms: &Datoms, epoch: u32, place: &Value, after: &Value) -> Result<datascript::db::Cursor> {
+    match (place.as_seq(), after) {
+        (None, Value::Nil) => Ok(datoms.cursor()),
+        (Some([then, path @ ..]), _) if then.as_num() == Some(epoch as f64) => {
+            let path: Vec<u16> = path.iter().map(|p| p.as_num().unwrap_or(-1.0) as u16).collect();
+            datoms.cursor_at(&path)
+        }
+        (_, Value::Datom(last)) => Ok(datoms.cursor_after(last)),
+        _ => Err(Error::msg("datascript: a run of datoms is read on from a place and the last datom read")),
+    }
+}
+
+/// Writes `[datoms place]`: at most `n` of a run of datoms, from its start or from where a read before left off,
+/// and the place to read on from when there may be more.
+fn write_chunk(w: &mut Writer, datoms: Datoms, epoch: u32, at: &[Value]) -> Result<()> {
+    let (n, reverse, place, after) = (arg(at, 0), arg(at, 1), arg(at, 2), arg(at, 3));
     let datoms = if reverse.truthy() { datoms.reversed() } else { datoms };
     let n = count_arg(n);
-    let mut cursor = match place.as_seq() {
-        None => datoms.cursor(),
-        Some(path) => {
-            let path: Vec<u16> = path.iter().map(|p| p.as_num().unwrap_or(-1.0) as u16).collect();
-            datoms.cursor_at(&path)?
-        }
-    };
+    let mut cursor = cursor_of(&datoms, epoch, place, after)?;
     w.count(VECTOR, 2);
     let run = w.datoms_begin();
     let count = datoms.for_chunk(&mut cursor, n, |d| w.datom_of_run(d))?;
@@ -141,8 +151,10 @@ fn write_chunk(w: &mut Writer, datoms: Datoms, n: &Value, reverse: &Value, place
     if cursor.is_done() || count < n {
         w.byte(crate::codec::NIL);
     } else {
+        // the place, and which building of the indexes it is a place in
         let path = cursor.place();
-        w.count(VECTOR, path.len());
+        w.count(VECTOR, 1 + path.len());
+        w.number(epoch as f64);
         for p in path {
             w.number(*p as f64);
         }
@@ -151,7 +163,7 @@ fn write_chunk(w: &mut Writer, datoms: Datoms, n: &Value, reverse: &Value, place
 }
 
 /// The run of datoms a read finds, for the operations that answer one: `None` of any other operation. With it,
-/// where its `n`, `reverse?` and `place` are among the arguments.
+/// where its `n`, `reverse?`, `place` and `after` are among the arguments.
 fn found(op: u32, args: &[Value]) -> Option<Result<(Datoms, usize)>> {
     Some(match op {
         DATOMS | SEEK_DATOMS | RSEEK_DATOMS => (|| {
@@ -208,7 +220,9 @@ pub fn answer(op: u32, args: &[Value], w: &mut Writer) -> Result<()> {
     match found(op, args) {
         Some(found) => {
             let (datoms, at) = found?;
-            write_chunk(w, datoms, arg(args, at), arg(args, at + 1), arg(args, at + 2))
+            // after the run is found: finding it may be what made the database's indexes again
+            let epoch = db_arg(args, 0)?.epoch();
+            write_chunk(w, datoms, epoch, args.get(at..).unwrap_or(&[]))
         }
         None => {
             w.value(&dispatch(op, args)?);
@@ -303,14 +317,9 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
             let of = datascript::clj::seq(arg(args, 1))?;
             let (datoms, at) =
                 found(read, &of).ok_or_else(|| Error::msg("datascript: not an operation that reads datoms"))??;
+            let epoch = db_arg(&of, 0)?.epoch();
             let datoms = if arg(&of, at + 1).truthy() { datoms.reversed() } else { datoms };
-            let mut cursor = match arg(&of, at + 2).as_seq() {
-                None => datoms.cursor(),
-                Some(path) => {
-                    let path: Vec<u16> = path.iter().map(|p| p.as_num().unwrap_or(-1.0) as u16).collect();
-                    datoms.cursor_at(&path)?
-                }
-            };
+            let mut cursor = cursor_of(&datoms, epoch, arg(&of, at + 2), arg(&of, at + 3))?;
             Value::from(datoms.for_chunk(&mut cursor, usize::MAX, |_| ())?)
         }
         FIND_DATOM => {

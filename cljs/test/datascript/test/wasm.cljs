@@ -208,6 +208,49 @@
       (is (= #{[1]} (d/q '[:find ?e :where [?e :name "n35"]] (:db-before (nth @reports 37)))))
       (is (= (last values) @conn)))))
 
+(deftest test-a-run-read-while-its-connection-moves-on
+  (let [schema {:tag {:db/index true}}
+        fresh  (fn []
+                 (let [conn (d/create-conn schema)]
+                   (d/transact! conn (for [i (range 1 1501)] {:db/id i :n i :tag (str "t" (mod i 13))}))
+                   conn))
+        row    (juxt :e :a :v :tx)
+        ;; reads a run a datom at a time, transacting on the connection on the way: early on, two transactions that
+        ;; change the indexes all through what is still to be read, so that the database being read, made again from
+        ;; the one after them, is built another way; and then one every so often at the datoms just read
+        walk   (fn [conn run]
+                 (let [seen (volatile! [])]
+                   (doseq [d run]
+                     (vswap! seen conj (row d))
+                     (case (count @seen)
+                       40 (d/transact! conn (for [e (range 1 1500 4)] [:db/add e :extra e]))
+                       45 (d/transact! conn (for [e (range 2 1500 7)] [:db/add e :tag "t5x"]))
+                       (when (zero? (mod (count @seen) 100))
+                         (d/transact! conn [[:db/add (:e d) :seen (count @seen)]
+                                            [:db/retract (:e d) :tag (str "t" (mod (:e d) 13))]
+                                            {:db/id (+ 5000 (count @seen)) :tag "t5" :n 0}]))))
+                   @seen))]
+    (testing "a run of datoms of a database a connection has since moved on from is read to its end as it was"
+      (are [read] (let [conn     (fresh)
+                        db       @conn
+                        expected (mapv row (into [] (read db)))]
+                    (= expected (walk conn (read db))))
+        #(d/datoms % :eavt)
+        #(d/datoms % :aevt)
+        #(d/datoms % :avet)
+        #(d/seek-datoms % :eavt 700)
+        #(d/rseek-datoms % :eavt 700)
+        #(rseq (d/datoms % :aevt :tag))
+        #(d/index-range % :tag "t1" "t7")
+        #(d/datoms (d/filter % (fn [_ datom] (odd? (:e datom)))) :aevt)))
+    (testing "and counts as it did"
+      (let [conn (fresh)
+            db   @conn
+            run  (d/datoms db :eavt)]
+        (d/transact! conn [[:db/add 1 :n 100] [:db/add 9000 :n 1]])
+        (is (= 3000 (count run)))
+        (is (= 3001 (count (d/datoms @conn :eavt))))))))
+
 (defn- settle
   "Calls back once the garbage collector has run and what it frees has been let go of."
   [rounds done]

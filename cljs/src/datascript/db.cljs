@@ -267,8 +267,8 @@
 
 (defn- datom-seq
   "What an operation that reads a run of datoms answers, [datoms place], as a sequence: the datoms, and, when
-  there is a place to read on from, the same operation with that place and room for more at `at` among its
-  arguments, where how many to read, whether backwards and the place are."
+  there is a place to read on from, the same operation with that place, the last datom read and room for more
+  at `at` among its arguments, where how many to read, whether backwards, the place and the last datom are."
   [op ^array args at answer reversed]
   (let [^array datoms (nth answer 0)
         place         (nth answer 1)]
@@ -278,6 +278,7 @@
           (let [args (.slice args)]
             (aset args at (min max-chunk (* 4 (aget args at))))
             (aset args (+ at 2) place)
+            (aset args (+ at 3) (aget datoms (dec (.-length datoms))))
             (More. op args at false nil)))
         reversed nil))))
 
@@ -339,9 +340,10 @@
 (def ^:const ^:private first-chunk-seek 16)
 
 (defn- read-run
-  "A run of datoms, read by an operation whose arguments end in how many, whether backwards, and where from."
+  "A run of datoms, read by an operation whose arguments end in how many, whether backwards, and where from: the
+  place a read before answered, and the last datom it answered."
   [op ^array args]
-  (let [at (- (.-length args) 3)]
+  (let [at (- (.-length args) 4)]
     (datom-seq op args at (wasm/call op args)
       (fn []
         (let [args (.slice args)]
@@ -350,14 +352,14 @@
           (datom-seq op args at (wasm/call op args) nil))))))
 
 (defn- index-read [op db index c0 c1 c2 c3]
-  (read-run op #js [db index c0 c1 c2 c3 (if (== op wasm/op-datoms) first-chunk first-chunk-seek) false nil]))
+  (read-run op #js [db index c0 c1 c2 c3 (if (== op wasm/op-datoms) first-chunk first-chunk-seek) false nil nil]))
 
 (defn- range-read [db attr start end]
-  (read-run wasm/op-index-range #js [db attr start end first-chunk false nil]))
+  (read-run wasm/op-index-range #js [db attr start end first-chunk false nil nil]))
 
 (defn- search-read [db pattern]
   (let [[e a v tx] pattern]
-    (read-run wasm/op-search #js [db e a v tx first-chunk false nil])))
+    (read-run wasm/op-search #js [db e a v tx first-chunk false nil nil])))
 
 ;; A database value: the handle of one in the module. `owner` is what holds the handle: when nothing
 ;; holds the owner any more, the module is told to let the database go.
@@ -712,7 +714,7 @@
 
 (defn numeric-eid-exists? ^boolean [db eid]
   ;; one datom of the entity's, if it has any
-  (pos? (.-length (nth (wasm/call wasm/op-datoms #js [db :eavt eid nil nil nil 1 false nil]) 0))))
+  (pos? (.-length (nth (wasm/call wasm/op-datoms #js [db :eavt eid nil nil nil 1 false nil nil]) 0))))
 
 (defn find-datom [db index c0 c1 c2 c3]
   (wasm/call wasm/op-find-datom #js [db index c0 c1 c2 c3]))
