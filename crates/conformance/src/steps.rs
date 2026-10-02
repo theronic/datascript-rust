@@ -474,16 +474,14 @@ fn run_step(env: &Env, step: &Value) -> Result<(String, Value)> {
             (p(&v), nothing)
         }
         "serializable" => {
-            let json = serialize::serializable(&db_arg(&arg("db")?)?, &serialize::Options::default())?;
-            let text = json.to_json_string();
-            let db = serialize::from_serializable(&serialize::Json::parse(&text)?, &serialize::Options::default())?;
+            let text = serialize::serializable_text(&db_arg(&arg("db")?)?, &serialize::Options::default())?;
+            let db = serialize::from_serializable_text(&text, &serialize::Options::default())?;
             (format!("{} {}", text, db_line(&db)?), Value::Db(db))
         }
         "from-serializable" => {
             let text = arg("json")?;
-            let json =
-                serialize::Json::parse(text.as_str().ok_or_else(|| Error::msg("from-serializable takes JSON"))?)?;
-            let db = serialize::from_serializable(&json, &serialize::Options::default())?;
+            let text = text.as_str().ok_or_else(|| Error::msg("from-serializable takes JSON"))?;
+            let db = serialize::from_serializable_text(text, &serialize::Options::default())?;
             (db_line(&db)?, Value::Db(db))
         }
         "read-db" => {

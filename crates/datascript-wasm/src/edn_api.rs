@@ -20,7 +20,7 @@
 use crate::state::with_state;
 use datascript::db;
 use datascript::print::pr_str;
-use datascript::serialize::{self, Json};
+use datascript::serialize;
 use datascript::value::{HostObj, HostObject};
 use datascript::{clj, edn, CljMap, Db, Error, Index, Result, Value};
 use std::any::Any;
@@ -145,12 +145,10 @@ fn run(text: &str) -> Result<Value> {
         },
         "schema" => db_of(arg(1))?.schema_value(),
         "count" => Value::from(db_of(arg(1))?.count()?),
-        "serializable" => {
-            Value::from(serialize::serializable(&db_of(arg(1))?, &serialize::Options::default())?.to_json_string())
-        }
+        "serializable" => Value::from(serialize::serializable_text(&db_of(arg(1))?, &serialize::Options::default())?),
         "from-serializable" => {
             let text = arg(1).as_str().ok_or_else(|| Error::msg("from-serializable takes JSON text"))?;
-            Value::Db(serialize::from_serializable(&Json::parse(text)?, &serialize::Options::default())?)
+            Value::Db(serialize::from_serializable_text(text, &serialize::Options::default())?)
         }
         "db-string" => Value::from(pr_str(&Value::Db(db_of(arg(1))?))),
         "read-db" => {

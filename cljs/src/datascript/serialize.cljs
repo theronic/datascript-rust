@@ -14,6 +14,14 @@
   ([db {:keys [freeze-fn freeze-kw]}]
    (js/JSON.parse (wasm/call wasm/op-serializable #js [db freeze-fn freeze-kw]))))
 
+(defn json
+  "The JSON text of (serializable db opts): what js/JSON.stringify makes of it, written by the module
+  itself with no JavaScript data made of it in between. For a program that keeps its database as text:
+  it is the faster way, and leaves the garbage collector nothing."
+  ([db] (json db {}))
+  ([db {:keys [freeze-fn freeze-kw]}]
+   (wasm/call wasm/op-serializable #js [db freeze-fn freeze-kw])))
+
 (defn- json-text
   "What from-serializable is given, as JSON text: JavaScript's data as it is, ClojureScript's as the
   JavaScript data it stands for."
@@ -29,3 +37,10 @@
   ([from] (from-serializable from {}))
   ([from {:keys [thaw-fn thaw-kw]}]
    (wasm/call wasm/op-from-serializable #js [(json-text from) thaw-fn thaw-kw])))
+
+(defn from-json
+  "The database of a JSON text that json wrote, or js/JSON.stringify of what serializable answered:
+  (from-serializable (js/JSON.parse text) opts), with no JavaScript data made of the text."
+  ([text] (from-json text {}))
+  ([text {:keys [thaw-fn thaw-kw]}]
+   (wasm/call wasm/op-from-serializable #js [text thaw-fn thaw-kw])))

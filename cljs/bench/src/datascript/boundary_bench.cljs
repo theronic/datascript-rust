@@ -3,7 +3,7 @@
   ClojureScript DataScript (../src) and over the WebAssembly module (cljs/src), in Node.
   cljs/bench.sh runs both and prints them side by side."
   (:require
-    [datascript.bench-setup]
+    [datascript.bench-setup :as setup]
     [datascript.core :as d]
     [goog.object :as gobj]))
 
@@ -117,6 +117,16 @@
     (bench "filter, then datoms of an entity"
       (let [f (d/filter db (fn [_ d] (not= :salary (.-a d))))]
         (fn [i] (count (vec (d/datoms f :eavt (id i)))))))
+    (bench "serializable, all 180k datoms"
+      (fn [_] (gobj/get (d/serializable db) "count")))
+    (bench "from-serializable, the same"
+      (let [data (d/serializable db)]
+        (fn [_] (:max-eid (d/from-serializable data)))))
+    (bench "a database to JSON text"
+      (fn [_] (.-length (setup/to-json db))))
+    (bench "a database from JSON text"
+      (let [text (setup/to-json db)]
+        (fn [_] (:max-eid (setup/from-json text)))))
     ((fn run [i]
        (if (< i (.-length benches))
          (let [[name f] (aget benches i)]

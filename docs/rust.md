@@ -213,14 +213,17 @@ transacted ten thousand entities at a time through DataScript's JavaScript API, 
 |---|---:|---:|
 | the database loaded | 103 MB | 103 MB |
 | after 50,000 transactions of one datom | 101 MB | 107 MB |
-| after `serializable` | 117 MB | 271 MB |
+| after `serializable`, 19 MB of JSON | 117 MB | 159 MB |
+| after `from-serializable` of it, a second database | 204 MB | 227 MB |
 
-The module's memory is the most it has needed at once: WebAssembly's memory grows and is never given back.
-`serializable` builds the whole of what it answers before any of it crosses, 19 MB of JSON here, and what it took to
-build stays the module's, free for whatever the module needs next.
+The module's memory is the most it has needed at once: WebAssembly's memory grows and is never given back. What
+`serializable` takes while it writes, the text and where each datom is in the other two indexes, stays the module's
+afterwards, free for whatever the module needs next; the text itself is the program's, 24 MB of its own heap.
 
 A node of an index holds what it has and room for one datom more, where a vector that doubles would have left the
-indexes half empty: the database above took 149 MB before its nodes were made to fit.
+indexes half empty: the database above took 149 MB before its nodes were made to fit. A database is written out as
+it is read, a datom at a time, and read back a row at a time, with nothing made of the whole of it in between:
+`serializable` left the module at 298 MB before that.
 
 ## How fast it is
 
@@ -230,31 +233,41 @@ and 180,000 datoms, on a laptop:
 
 | | ClojureScript | WebAssembly | ratio |
 |---|---:|---:|---:|
-| transact 20,000 entities, ms | 806 | 337 | 0.42 |
-| `(first (d/datoms db :eavt e :name))` | 0.88 | 1.45 | 1.66 |
-| `(vec (d/datoms db :eavt e))` | 1.00 | 2.31 | 2.31 |
-| `find-datom` | 0.79 | 1.03 | 1.29 |
-| `seek-datoms`, the first three | 0.92 | 2.83 | 3.09 |
-| `index-range`, ten datoms | 2.73 | 8.40 | 3.08 |
-| `entid` of a lookup ref | 2.64 | 1.40 | 0.53 |
-| an entity's attribute | 1.60 | 2.78 | 1.74 |
-| an entity, touched | 8.15 | 10.4 | 1.27 |
-| `pull`, two attributes | 2.26 | 2.14 | 0.94 |
-| `pull`, wildcard | 8.60 | 5.07 | 0.59 |
-| `q`, one entity's attribute | 33.1 | 4.96 | 0.15 |
-| `q`, a join of about 20 rows | 2117 | 1113 | 0.53 |
-| `q`, a predicate over 20,000 | 3584 | 678 | 0.19 |
-| `q`, with a function of the program's over 20,000 | 1144 | 1815 | 1.59 |
-| `with`, one datom | 9.22 | 9.06 | 0.98 |
-| `with`, an entity of five attributes | 36.9 | 16.7 | 0.45 |
-| `transact!`, one datom, with a listener | 3.87 | 2.94 | 0.76 |
-| all 180,000 datoms, counted | 3402 | 585 | 0.17 |
-| all 180,000 datoms, reduced over | 4777 | 16764 | 3.51 |
-| a filtered database's datoms of an entity | 1.97 | 5.05 | 2.57 |
+| transact 20,000 entities, ms | 747 | 324 | 0.43 |
+| `(first (d/datoms db :eavt e :name))` | 0.79 | 1.32 | 1.66 |
+| `(vec (d/datoms db :eavt e))` | 0.95 | 2.08 | 2.20 |
+| `find-datom` | 0.71 | 0.96 | 1.35 |
+| `seek-datoms`, the first three | 0.83 | 2.61 | 3.13 |
+| `index-range`, ten datoms | 2.43 | 7.37 | 3.03 |
+| `entid` of a lookup ref | 2.36 | 1.34 | 0.57 |
+| an entity's attribute | 1.51 | 2.57 | 1.70 |
+| an entity, touched | 7.36 | 9.52 | 1.29 |
+| `pull`, two attributes | 2.11 | 1.88 | 0.89 |
+| `pull`, wildcard | 8.03 | 4.06 | 0.51 |
+| `q`, one entity's attribute | 30.6 | 4.32 | 0.14 |
+| `q`, a join of about 20 rows | 1653 | 990 | 0.60 |
+| `q`, a predicate over 20,000 | 3257 | 629 | 0.19 |
+| `q`, with a function of the program's over 20,000 | 1051 | 1737 | 1.65 |
+| `with`, one datom | 8.35 | 8.40 | 1.01 |
+| `with`, an entity of five attributes | 33.6 | 15.3 | 0.45 |
+| `transact!`, one datom, with a listener | 3.75 | 2.72 | 0.73 |
+| all 180,000 datoms, counted | 3189 | 554 | 0.17 |
+| all 180,000 datoms, reduced over | 3642 | 15841 | 4.35 |
+| a filtered database's datoms of an entity | 1.72 | 4.33 | 2.52 |
+| `serializable`, all 180,000 datoms | 11858 | 35605 | 3.00 |
+| `from-serializable`, the same | 12048 | 32701 | 2.71 |
+| the database to JSON text | 25297 | 21986 | 0.87 |
+| the database from JSON text | 31199 | 27781 | 0.89 |
 
 What the module does inside, queries, pulls and transactions, is up to seven times faster. A read of a few datoms
 pays for the crossing, a microsecond or two; a function of the program's that a query calls for every row pays for it
 every row; and reading every datom of a database into ClojureScript pays for making each one again there.
+
+`serializable` pays for it too: the module writes the database as JSON text, and the text is parsed into the
+JavaScript data DataScript answers with. A program that keeps its database as text has no use for the data in
+between, and `datascript.serialize/json` and `from-json` (`serializable_json` and `from_json` in JavaScript) are the
+two without it: the text `JSON.stringify` makes of `serializable`, and the database of such a text. Those are the
+last two rows, against `JSON.stringify` of `serializable` and `from-serializable` of `JSON.parse` in ClojureScript.
 
 The module is 1.0 MB, 250 KB at brotli's best; built for size (`opt-level = "z"`), 0.85 MB and 215 KB. The
 ClojureScript interface adds less to a program than DataScript itself does.

@@ -280,6 +280,25 @@ impl Datoms {
         Ok(self.first()?.is_none())
     }
 
+    /// The datoms where the index has them, for as long as this run is kept.
+    pub fn refs(&self) -> Result<Vec<&Datom>> {
+        self.check()?;
+        let mut out = Vec::new();
+        let plain = self.unfiltered();
+        let mut keep = |d| -> Result<()> {
+            if plain || self.keep(d)? {
+                out.push(d);
+            }
+            Ok(())
+        };
+        if self.rev {
+            self.slice.iter_rev().try_for_each(&mut keep)?;
+        } else {
+            self.slice.iter().try_for_each(&mut keep)?;
+        }
+        Ok(out)
+    }
+
     pub fn to_vec(&self) -> Result<Vec<Datom>> {
         self.check()?;
         if self.unfiltered() && !self.rev {
@@ -1135,20 +1154,13 @@ impl Db {
     /// `restore-db`: a database of indexes already in order, as a serialized one is read back.
     pub(crate) fn restore(
         schema: Arc<Schema>,
-        eavt: Vec<Datom>,
-        aevt: Vec<Datom>,
-        avet: Vec<Datom>,
+        eavt: SortedSet<Datom>,
+        aevt: SortedSet<Datom>,
+        avet: SortedSet<Datom>,
         max_eid: i32,
         max_tx: i32,
     ) -> Db {
-        Db::plain_of(DbCore {
-            schema,
-            eavt: SortedSet::from_sorted(eavt),
-            aevt: SortedSet::from_sorted(aevt),
-            avet: SortedSet::from_sorted(avet),
-            max_eid,
-            max_tx,
-        })
+        Db::plain_of(DbCore { schema, eavt, aevt, avet, max_eid, max_tx })
     }
 
     /// `(with-schema db schema)`: the same datoms under another schema, which is neither validated nor applied to

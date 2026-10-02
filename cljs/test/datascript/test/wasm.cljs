@@ -4,6 +4,7 @@
     [clojure.test :as t :refer [is are deftest testing async]]
     [datascript.core :as d]
     [datascript.db :as db]
+    [datascript.serialize :as serialize]
     [datascript.wasm :as wasm]))
 
 (defrecord Point [x y])
@@ -186,6 +187,46 @@
     (is (= {db1 :found} {db2 :found}))
     (is (= "#datascript/DB {:schema nil, :datoms [[1 :name \"Ivan\" 536870913]]}" (pr-str db1)))
     (is (= db1 (cljs.reader/read-string (pr-str db1))))))
+
+(deftest test-a-database-as-text
+  (let [db (d/db-with (d/empty-db {:aka {:db/cardinality :db.cardinality/many} :age {:db/index true}})
+             [{:db/id 1 :name "Petr \"the\" \\ Great\n\u0001é😀" :aka ["Devil" "Tupen"] :age 15 :kw :some/kw
+               :attach {:k [1 2]}}
+              {:db/id 2 :inf ##Inf :ninf ##-Inf :nan ##NaN :b false :age 15 :half 0.5 :big 1e21 :neg -7}])
+        text (serialize/json db)]
+    (testing "the text the module writes is the text JSON.stringify makes of serializable"
+      (is (string? text))
+      (is (= text (js/JSON.stringify (d/serializable db)))))
+    (testing "and it reads back as the database, as text and as JavaScript's data"
+      ;; NaN is not NaN: compared as printed
+      (is (= (pr-str db) (pr-str (serialize/from-json text))))
+      (is (= (pr-str db) (pr-str (d/from-serializable (js/JSON.parse text)))))
+      (is (= (vec (d/datoms db :avet)) (vec (d/datoms (serialize/from-json text) :avet)))))
+    (testing "with what stands for values and keywords chosen by the program"
+      (let [freeze {:freeze-fn #(str "!" (pr-str %)) :freeze-kw #(subs (str %) 1)}
+            thaw   {:thaw-fn #(cljs.reader/read-string (subs % 1)) :thaw-kw keyword}
+            text   (serialize/json db freeze)]
+        (is (= text (js/JSON.stringify (d/serializable db freeze))))
+        (is (re-find #"\"some/kw\"" text))
+        (is (= (pr-str db) (pr-str (serialize/from-json text thaw))))))
+    (testing "what is no database is told so, the same whichever way it is read"
+      (doseq [bad ["{}" "[]" "7" "{\"tx0\":1}"
+                   "{\"tx0\":536870912,\"schema\":\"nil\",\"attrs\":[],\"keywords\":[],\"eavt\":7}"
+                   "{\"tx0\":536870912,\"schema\":\"nil\",\"attrs\":[\":a\"],\"keywords\":[],\"eavt\":[[1,0,[9],1]]}"]]
+        (let [told #(try (%) :read (catch :default e (ex-message e)))]
+          (is (string? (told #(serialize/from-json bad))))
+          (is (= (told #(d/from-serializable (js/JSON.parse bad))) (told #(serialize/from-json bad))))))
+      (is (thrown? js/Error (serialize/from-json "{\"tx0\":")))
+      (is (thrown? js/Error (serialize/from-json "no JSON at all"))))
+    (testing "a database of many datoms, which is read a row at a time"
+      (let [many (d/db-with (d/empty-db {:name {:db/index true} :aka {:db/cardinality :db.cardinality/many}})
+                   (for [i (range 1 3001)]
+                     {:db/id i :name (str "n" i) :age (mod i 90) :aka [(str "a" i) (str "b" (mod i 7))] :kw (keyword (str "k" (mod i 5)))}))
+            text (serialize/json many)]
+        (is (= text (js/JSON.stringify (d/serializable many))))
+        (is (= many (serialize/from-json text)))
+        (is (= (vec (d/datoms many :aevt)) (vec (d/datoms (serialize/from-json text) :aevt))))
+        (is (= (vec (d/datoms many :avet)) (vec (d/datoms (d/from-serializable (js/JSON.parse text)) :avet))))))))
 
 (deftest test-a-connection-moves-on
   (testing "the values a connection moved on from are the values they were, however far it has moved on since"

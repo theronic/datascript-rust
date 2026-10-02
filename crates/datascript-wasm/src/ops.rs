@@ -217,6 +217,15 @@ fn found(op: u32, args: &[Value]) -> Option<Result<(Datoms, usize)>> {
 
 /// One operation, its answer written: a run of datoms as it is read, anything else as its value.
 pub fn answer(op: u32, args: &[Value], w: &mut Writer) -> Result<()> {
+    if op == SERIALIZABLE {
+        // the database as text, written into the answer as it is: no value is made of what may be most of memory
+        let (freeze_fn, freeze_kw) = (freezer(arg(args, 1)), freezer(arg(args, 2)));
+        let options = serialize_options(&freeze_fn, &freeze_kw, &None, &None);
+        let text = serialize::serializable_text(&db_arg(args, 0)?, &options)?;
+        w.byte(crate::codec::STR);
+        w.str(&text);
+        return Ok(());
+    }
     match found(op, args) {
         Some(found) => {
             let (datoms, at) = found?;
@@ -349,21 +358,11 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
         }),
         DB_HASH => Value::from(db_arg(args, 0)?.cljs_hash()),
         DB_EMPTY => Value::Db(db_arg(args, 0)?.empty_like()?),
-        SERIALIZABLE => {
-            let (freeze_fn, freeze_kw) = (freezer(arg(args, 1)), freezer(arg(args, 2)));
-            let json =
-                serialize::serializable(&db_arg(args, 0)?, &serialize_options(&freeze_fn, &freeze_kw, &None, &None))?;
-            Value::from(json.to_json_string())
-        }
         FROM_SERIALIZABLE => {
             let text =
                 arg(args, 0).as_str().ok_or_else(|| Error::msg("datascript: from-serializable takes JSON text"))?;
             let (thaw_fn, thaw_kw) = (thawer(arg(args, 1)), thawer(arg(args, 2)));
-            let db = serialize::from_serializable(
-                &Json::parse(text)?,
-                &serialize_options(&None, &None, &thaw_fn, &thaw_kw),
-            )?;
-            Value::Db(db)
+            Value::Db(serialize::from_serializable_text(text, &serialize_options(&None, &None, &thaw_fn, &thaw_kw))?)
         }
         DIFF => db::diff(&db_arg(args, 0)?, &db_arg(args, 1)?)?,
         RELEASE_DB => {

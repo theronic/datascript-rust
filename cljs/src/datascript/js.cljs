@@ -90,6 +90,10 @@
 
 (def ^:export serializable #(serialize/serializable % {:freeze-kw identity}))
 (def ^:export from_serializable #(serialize/from-serializable % {:thaw-kw identity}))
+;; the same two as JSON text, which the module writes and reads itself: JSON.stringify(serializable(db)) and
+;; from_serializable(JSON.parse(text)), with no JavaScript data made in between
+(def ^:export serializable_json #(serialize/json % {:freeze-kw identity}))
+(def ^:export from_json #(serialize/from-json % {:thaw-kw identity}))
 
 (defn ^:export q [query & sources]
   (let [query   (cljs.reader/read-string query)
