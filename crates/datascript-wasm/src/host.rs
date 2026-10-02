@@ -187,6 +187,13 @@ pub fn call(handle: u32, args: &[Value]) -> Result<Value> {
 /// A call whose arguments are written.
 fn call_written(handle: u32, w: Writer) -> Result<Value> {
     let status = raw_call(handle, &w.buf);
+    // what a predicate answers is the status alone
+    match status {
+        2 => return Ok(Value::Nil),
+        3 => return Ok(Value::Bool(false)),
+        4 => return Ok(Value::Bool(true)),
+        _ => {}
+    }
     let reply = take_reply().ok_or_else(|| Error::msg("datascript: the host answered a call with nothing"))?;
     if status == 0 {
         Reader::new(&reply).value()

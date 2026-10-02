@@ -1,6 +1,5 @@
-//! What the module keeps between calls: the databases, cursors and functions the host holds handles to.
+//! What the module keeps between calls: the databases and functions the host holds handles to.
 
-use datascript::db::{Cursor, Datoms};
 use datascript::value::{Func, WeakFunc};
 use datascript::{Db, Error, Result};
 use std::cell::RefCell;
@@ -56,10 +55,6 @@ pub struct State {
     dbs: Slab<Db>,
     /// A database value has one handle while the host holds it: the same value is the same handle
     db_by_identity: HashMap<usize, u32>,
-    /// The runs of datoms the host reads a part at a time. A cursor's number is never another's, so that a host
-    /// that gives one back late gives back nothing else.
-    cursors: HashMap<u32, (Datoms, Cursor)>,
-    next_cursor: u32,
     module_fns: Slab<Func>,
     module_fn_by_id: HashMap<u32, u32>,
     /// The host's functions that are held here, by the host's handles: the same function is the same value
@@ -113,19 +108,9 @@ impl State {
         Some(f)
     }
 
-    pub fn insert_cursor(&mut self, cursor: (Datoms, Cursor)) -> u32 {
-        self.next_cursor = self.next_cursor.wrapping_add(1);
-        self.cursors.insert(self.next_cursor, cursor);
-        self.next_cursor
-    }
-
-    pub fn take_cursor(&mut self, handle: u32) -> Option<(Datoms, Cursor)> {
-        self.cursors.remove(&handle)
-    }
-
-    /// How much is held: databases, cursors, functions. For a host that checks it gives back what it takes.
-    pub fn held(&self) -> (usize, usize, usize) {
-        (self.dbs.len(), self.cursors.len(), self.module_fns.len())
+    /// How much is held: databases, functions. For a host that checks it gives back what it takes.
+    pub fn held(&self) -> (usize, usize) {
+        (self.dbs.len(), self.module_fns.len())
     }
 }
 

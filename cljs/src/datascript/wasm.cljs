@@ -22,10 +22,8 @@
 (def ^:const t-int 3)
 (def ^:const t-f64 4)
 (def ^:const t-str 5)
-(def ^:const t-kw-def 6)
-(def ^:const t-kw-ref 7)
-(def ^:const t-sym-def 8)
-(def ^:const t-sym-ref 9)
+(def ^:const t-kw 6)
+(def ^:const t-sym 8)
 (def ^:const t-vector 10)
 (def ^:const t-list 11)
 (def ^:const t-array-map 12)
@@ -42,6 +40,7 @@
 (def ^:const t-module-fn 23)
 (def ^:const t-db-info 24)
 (def ^:const t-type 25)
+(def ^:const t-datoms 26)
 
 (def ^:const op-empty-db 1)
 (def ^:const op-init-db 2)
@@ -57,8 +56,7 @@
 (def ^:const op-rseek-datoms 12)
 (def ^:const op-index-range 13)
 (def ^:const op-search 14)
-(def ^:const op-cursor-next 15)
-(def ^:const op-cursor-free 16)
+(def ^:const op-count-run 15)
 (def ^:const op-find-datom 17)
 (def ^:const op-entid 18)
 (def ^:const op-db-info 19)
@@ -87,6 +85,8 @@
 
 (def ^{:doc "The Datom type, and (fn [e a v tx added]) that makes one."} datom-type nil)
 (def datom-ctor nil)
+(def ^{:doc "(fn [reader]) → the run of datoms the reader is at, as an array"} datoms-reader nil)
+(def ^{:doc "(fn []), called when an instance of the module is taken: what was kept of another is forgotten"} on-attach nil)
 (def ^{:doc "(fn [handle schema-uid max-eid max-tx filtered?]) → the database value of a handle"} db-ctor nil)
 (def ^{:doc "(fn [x]) → the handle of a database value, nil of anything else"} db-handle nil)
 
@@ -99,6 +99,9 @@
 (def ^:private ds-result-ptr nil)
 (def ^:private ds-result-len nil)
 (def ^:private ds-recover nil)
+(def ^:private ds-intern nil)
+(def ^:private ds-name-ptr nil)
+(def ^:private ds-name-len nil)
 ;; the module's own stack, in its memory: the pointer to its top
 (def ^:private stack-pointer nil)
 
@@ -109,6 +112,17 @@
 
 (def ^:private text-encoder (js/TextEncoder.))
 (def ^:private text-decoder (js/TextDecoder. "utf-8"))
+
+;; The module's memory, as bytes and as a view to read numbers from. Memory that grows leaves these of no length,
+;; and they are made again.
+(def ^:private mem-u8 (js/Uint8Array. 0))
+(def ^:private mem-dv nil)
+
+(defn- mem! []
+  (when (zero? (.-length mem-u8))
+    (let [buffer (.-buffer memory)]
+      (set! mem-u8 (js/Uint8Array. buffer))
+      (set! mem-dv (js/DataView. buffer)))))
 
 ;; ---------------------------------------------------------------- the host's functions and values, by handle
 
@@ -185,7 +199,7 @@
 
 ;; ---------------------------------------------------------------- writing
 
-(deftype Enc [^:mutable buf ^:mutable dv ^:mutable pos ^:mutable kws ^:mutable syms ^:mutable depth])
+(deftype Enc [^:mutable buf ^:mutable dv ^:mutable pos ^:mutable depth])
 
 (def ^:private enc-pool (array))
 (def ^:private enc-depth 0)
@@ -197,13 +211,11 @@
   (let [depth enc-depth
         e     (or (aget enc-pool depth)
                 (let [buf (js/Uint8Array. 4096)
-                      e   (Enc. buf (js/DataView. (.-buffer buf)) 0 nil nil 0)]
+                      e   (Enc. buf (js/DataView. (.-buffer buf)) 0 0)]
                   (aset enc-pool depth e)
                   e))]
     (set! enc-depth (inc depth))
     (set! (.-pos e) 0)
-    (set! (.-kws e) nil)
-    (set! (.-syms e) nil)
     (set! (.-depth e) 0)
     e))
 
@@ -285,17 +297,44 @@
     (do (w-byte e t-int) (w-zigzag e n))
     (do (w-byte e t-f64) (w-f64 e n))))
 
-(defn- w-named [^Enc e table-key fqn def-tag ref-tag]
-  (let [table (if (== def-tag t-kw-def)
-                (or (.-kws e) (set! (.-kws e) (js/Map.)))
-                (or (.-syms e) (set! (.-syms e) (js/Map.))))
-        id    (.get table fqn)]
-    (if (some? id)
-      (do (w-byte e ref-tag) (w-varint e id))
-      (do
-        (.set table fqn (.-size table))
-        (w-byte e def-tag)
-        (w-str e fqn)))))
+;; Keywords and symbols are numbers to the module, which numbers every name it meets, for good. Here, the numbers of
+;; the names that have crossed, and the keywords and symbols of the numbers: each is asked of the module once.
+(def ^:private kw-ids (js/Map.))
+(def ^:private sym-ids (js/Map.))
+(def ^:private kws (array))
+(def ^:private syms (array))
+
+(defn- number-of
+  "The module's number for a name of a kind: 0 a keyword, 1 a symbol."
+  [kind fqn ^js ids]
+  (let [bytes (.encode text-encoder fqn)
+        len   (.-length bytes)
+        ptr   (unsigned-bit-shift-right (ds-alloc len) 0)]
+    (mem!)
+    (.set mem-u8 bytes ptr)
+    (let [id (ds-intern kind ptr len)]
+      (.set ids fqn id)
+      id)))
+
+(defn- name-of
+  "The name the module has for a number of a kind."
+  [kind id]
+  (let [ptr (unsigned-bit-shift-right (ds-name-ptr kind id) 0)
+        len (ds-name-len kind id)]
+    (when (zero? ptr)
+      (throw (js/Error. (str "datascript: no name of number " id))))
+    (mem!)
+    (.decode text-decoder (.subarray mem-u8 ptr (+ ptr len)))))
+
+(defn- w-keyword [^Enc e fqn]
+  (let [id (.get kw-ids fqn)]
+    (w-byte e t-kw)
+    (w-varint e (if (some? id) id (number-of 0 fqn kw-ids)))))
+
+(defn- w-symbol [^Enc e fqn]
+  (let [id (.get sym-ids fqn)]
+    (w-byte e t-sym)
+    (w-varint e (if (some? id) id (number-of 1 fqn sym-ids)))))
 
 (declare w-value)
 
@@ -337,7 +376,7 @@
     (nil? x)     (do (w-byte e t-nil) true)
     (number? x)  (do (w-number e x) true)
     (string? x)  (do (w-byte e t-str) (w-str e x) true)
-    (keyword? x) (do (w-named e nil (.-fqn x) t-kw-def t-kw-ref) true)
+    (keyword? x) (do (w-keyword e (.-fqn x)) true)
     (true? x)    (do (w-byte e t-true) true)
     (false? x)   (do (w-byte e t-false) true)
 
@@ -355,7 +394,7 @@
           true)))
 
     (symbol? x)
-    (do (w-named e nil (.-str x) t-sym-def t-sym-ref) true)
+    (do (w-symbol e (.-str x)) true)
 
     (some? (db-handle x))
     (do (w-byte e t-db) (w-varint e (db-handle x)) true)
@@ -540,23 +579,31 @@
         (w-deep e x)))))
 
 (defn- written
-  "What a writer holds, in the module's memory: [ptr len]."
+  "What a writer holds, copied into the module's memory: where it is there. It is (.-pos e) bytes long."
   [^Enc e]
   (let [len (.-pos e)
-        ptr (unsigned-bit-shift-right (ds-alloc len) 0)]
-    (.set (js/Uint8Array. (.-buffer memory) ptr len) (.subarray (.-buf e) 0 len))
-    #js [ptr len]))
+        ptr (unsigned-bit-shift-right (ds-alloc len) 0)
+        buf (.-buf e)]
+    (mem!)
+    (if (< len 96)
+      (let [mem mem-u8]
+        (loop [i 0]
+          (when (< i len)
+            (aset mem (+ ptr i) (aget buf i))
+            (recur (inc i)))))
+      (.set mem-u8 (.subarray buf 0 len) ptr))
+    ptr))
 
 ;; ---------------------------------------------------------------- reading
 
-(deftype Dec [buf dv ^:mutable pos ^:mutable kws ^:mutable syms ^:mutable depth])
+(deftype Dec [^:mutable buf ^:mutable dv ^:mutable pos ^:mutable depth ^:mutable busy])
 
-(defn- r-byte [^Dec d]
+(defn r-byte [^Dec d]
   (let [pos (.-pos d)]
     (set! (.-pos d) (inc pos))
     (aget (.-buf d) pos)))
 
-(defn- r-varint [^Dec d]
+(defn r-varint [^Dec d]
   (let [buf (.-buf d)]
     (loop [pos (.-pos d)
            n   0
@@ -568,7 +615,7 @@
             (+ n (* b mul)))
           (recur (inc pos) (+ n (* (bit-and b 127) mul)) (* mul 128)))))))
 
-(defn- r-zigzag [^Dec d]
+(defn r-zigzag [^Dec d]
   (let [n (r-varint d)]
     (bit-xor (unsigned-bit-shift-right n 1) (- (bit-and n 1)))))
 
@@ -577,26 +624,37 @@
     (set! (.-pos d) (+ pos 8))
     (.getFloat64 (.-dv d) pos true)))
 
+(defn r-u32 [^Dec d]
+  (let [pos (.-pos d)]
+    (set! (.-pos d) (+ pos 4))
+    (.getUint32 (.-dv d) pos true)))
+
+;; the characters of a short string, to make it of at once
+(def ^:private str-chars (array))
+
 (defn- r-str [^Dec d]
   (let [len   (r-varint d)
         buf   (.-buf d)
         start (.-pos d)
         end   (+ start len)]
     (set! (.-pos d) end)
-    (if (< len 24)
-      (loop [i start
-             s ""]
-        (if (< i end)
-          (let [c (aget buf i)]
-            (if (< c 128)
-              (recur (inc i) (str s (js/String.fromCharCode c)))
-              (.decode text-decoder (.subarray buf start end))))
-          s))
-      (.decode text-decoder (.subarray buf start end)))))
+    (cond
+      (zero? len) ""
 
-(def ^:private keywords
-  "Keywords by name: one is made once."
-  (js/Map.))
+      ;; short, and most likely ASCII: its characters are its bytes
+      (< len 64)
+      (let [chars str-chars]
+        (set! (.-length chars) len)
+        (loop [i 0]
+          (if (< i len)
+            (let [c (aget buf (+ start i))]
+              (if (< c 128)
+                (do (aset chars i c) (recur (inc i)))
+                (.decode text-decoder (.subarray buf start end))))
+            (.apply js/String.fromCharCode nil chars))))
+
+      :else
+      (.decode text-decoder (.subarray buf start end)))))
 
 (defn- named-parts
   "ns/name as the module splits it: at the first slash, unless the name is the slash."
@@ -606,18 +664,25 @@
       #js [nil fqn]
       #js [(.substring fqn 0 i) (.substring fqn (inc i))])))
 
-(defn- keyword-of [fqn]
-  (or (.get keywords fqn)
-    (let [parts (named-parts fqn)
-          k     (Keyword. (aget parts 0) (aget parts 1) fqn nil)]
-      (.set keywords fqn k)
-      k)))
+(defn- keyword-of
+  "The keyword of a number: made once, the first time the module sends the number."
+  [id]
+  (let [fqn   (name-of 0 id)
+        parts (named-parts fqn)
+        k     (Keyword. (aget parts 0) (aget parts 1) fqn nil)]
+    (aset kws id k)
+    (.set kw-ids fqn id)
+    k))
 
-(defn- symbol-of [fqn]
-  (let [parts (named-parts fqn)]
-    (symbol (aget parts 0) (aget parts 1))))
+(defn- symbol-of [id]
+  (let [fqn   (name-of 1 id)
+        parts (named-parts fqn)
+        s     (symbol (aget parts 0) (aget parts 1))]
+    (aset syms id s)
+    (.set sym-ids fqn id)
+    s))
 
-(declare r-value call)
+(declare r-value r-keyword call)
 
 (def ^:private module-fns (js/Map.))
 
@@ -681,14 +746,10 @@
     3 (r-zigzag d)
     4 (r-f64 d)
     5 (r-str d)
-    6 (let [k (keyword-of (r-str d))]
-        (.push (or (.-kws d) (set! (.-kws d) (array))) k)
-        k)
-    7 (aget (.-kws d) (r-varint d))
-    8 (let [s (symbol-of (r-str d))]
-        (.push (or (.-syms d) (set! (.-syms d) (array))) s)
-        s)
-    9 (aget (.-syms d) (r-varint d))
+    6 (r-keyword d)
+    8 (let [id (r-varint d)
+            s  (aget syms id)]
+        (if (some? s) s (symbol-of id)))
     16 (uuid (r-str d))
     17 (js/Date. (r-f64 d))
     18 (let [source (r-str d)
@@ -796,24 +857,57 @@
                 (aset around 2 (inc (aget around 2)))
                 (recur)))))))))
 
-(defn- r-value [^Dec d]
-  (let [tag (r-byte d)]
-    (if (nested-tag? tag)
-      (let [depth (.-depth d)]
-        (if (< depth max-depth)
-          (do
-            (set! (.-depth d) (inc depth))
-            (let [v (r-nested d tag)]
-              (set! (.-depth d) depth)
-              v))
-          (r-deep d tag)))
-      (r-flat d tag))))
+(defn r-tagged
+  "The value of a tag that was read."
+  [^Dec d tag]
+  (cond
+    (== tag t-datoms)
+    (datoms-reader d)
+
+    (nested-tag? tag)
+    (let [depth (.-depth d)]
+      (if (< depth max-depth)
+        (do
+          (set! (.-depth d) (inc depth))
+          (let [v (r-nested d tag)]
+            (set! (.-depth d) depth)
+            v))
+        (r-deep d tag)))
+
+    :else
+    (r-flat d tag)))
+
+(defn r-value [^Dec d]
+  (r-tagged d (r-byte d)))
+
+(defn r-keyword
+  "The keyword of the number the reader is at."
+  [^Dec d]
+  (let [id (r-varint d)
+        k  (aget kws id)]
+    (if (some? k) k (keyword-of id))))
+
+;; The reader of what the module writes. One is enough: a value is read whole before anything else is asked of the
+;; module. Were one ever read in the middle of another, it would get a reader of its own.
+(def ^:private the-dec (Dec. nil nil 0 0 false))
 
 (defn- read-at
   "The value the module wrote at ptr."
-  [ptr len]
-  (let [buf (js/Uint8Array. (.-buffer memory) ptr len)]
-    (r-value (Dec. buf (js/DataView. (.-buffer memory) ptr len) 0 nil nil 0))))
+  [ptr]
+  (mem!)
+  (let [^Dec d the-dec]
+    (if (.-busy d)
+      (r-value (Dec. mem-u8 mem-dv ptr 0 true))
+      (do
+        (set! (.-busy d) true)
+        (set! (.-buf d) mem-u8)
+        (set! (.-dv d) mem-dv)
+        (set! (.-pos d) ptr)
+        (set! (.-depth d) 0)
+        (try
+          (r-value d)
+          (finally
+            (set! (.-busy d) false)))))))
 
 ;; ---------------------------------------------------------------- calling
 
@@ -838,13 +932,19 @@
           (release! (if (== (aget pending i) 0) host-fns host-objs) (aget pending (inc i)))
           (recur (+ i 2)))))))
 
-(defn- write-args [^array args]
+(defn- ds-call-with
+  "Writes an operation's arguments and calls it: the status it answers."
+  [op ^array args]
   (let [e (enc-open)]
     (try
       (w-array e t-vector args)
-      (written e)
-      (finally
-        (enc-close)))))
+      (catch :default ex
+        (enc-close)
+        (throw ex)))
+    (let [len (.-pos e)
+          ptr (written e)]
+      (enc-close)
+      (ds-call op ptr len))))
 
 (defn call
   "An operation of the module's, with its arguments in an array: its value, or what it throws."
@@ -853,17 +953,16 @@
     (throw (js/Error. "DataScript's WebAssembly module is not loaded: datascript.wasm/instantiate first")))
   (set! calls (inc calls))
   (try
-    (let [at     (write-args args)
-          top    (.-value stack-pointer)
+    (let [top    (.-value stack-pointer)
           status (try
-                   (ds-call op (aget at 0) (aget at 1))
+                   (ds-call-with op args)
                    (catch :default e
                      ;; The call did not return: the stack ran out under it, or the module gave up. Its
                      ;; own stack is put back where it was, and what it was in the middle of is let go of.
                      (set! (.-value stack-pointer) top)
                      (ds-recover)
                      (throw e)))
-          v      (read-at (unsigned-bit-shift-right (ds-result-ptr) 0) (ds-result-len))]
+          v      (read-at (unsigned-bit-shift-right (ds-result-ptr) 0))]
       (if (== status 0)
         v
         ;; [message data exception]: what a function of the host's threw is thrown on as it was
@@ -896,14 +995,14 @@
         out))))
 
 (defn- reply! [^Enc e]
-  (let [at (written e)]
-    (ds-reply (aget at 0) (aget at 1))))
+  (let [len (.-pos e)]
+    (ds-reply (written e) len)))
 
 (defn- host-call
   "The module calls a function of the host's. What it throws goes back with the exception itself, for
   whoever called the module to be thrown it."
   [handle ptr len]
-  (let [args (read-at (unsigned-bit-shift-right ptr 0) len)
+  (let [args (read-at (unsigned-bit-shift-right ptr 0))
         f    (if (neg? handle)
                (case handle
                  -1 regex-exec
@@ -916,14 +1015,20 @@
                  -7 (fn [x] (when (map? x) (into {} x))))
                (aget (.-table host-fns) handle))]
     (try
-      (let [result (apply f args)
-            e      (enc-open)]
-        (try
-          (w-value e result)
-          (reply! e)
-          (finally
-            (enc-close)))
-        0)
+      (let [result (apply f args)]
+        ;; what a predicate answers needs no reply written: the status says it
+        (cond
+          (nil? result)   2
+          (false? result) 3
+          (true? result)  4
+          :else
+          (let [e (enc-open)]
+            (try
+              (w-value e result)
+              (reply! e)
+              (finally
+                (enc-close)))
+            0)))
       (catch :default ex
         (let [e (enc-open)]
           (try
@@ -940,7 +1045,8 @@
 (defn- reply-string! [s]
   (let [bytes (.encode text-encoder s)
         ptr   (unsigned-bit-shift-right (ds-alloc (.-length bytes)) 0)]
-    (.set (js/Uint8Array. (.-buffer memory) ptr (.-length bytes)) bytes)
+    (mem!)
+    (.set mem-u8 bytes ptr)
     (ds-reply ptr (.-length bytes))))
 
 (defn- host-op
@@ -993,6 +1099,17 @@
     (set! ds-result-ptr (gobj/get exports "ds_result_ptr"))
     (set! ds-result-len (gobj/get exports "ds_result_len"))
     (set! ds-recover (gobj/get exports "ds_recover"))
+    (set! ds-intern (gobj/get exports "ds_intern"))
+    (set! ds-name-ptr (gobj/get exports "ds_name_ptr"))
+    (set! ds-name-len (gobj/get exports "ds_name_len"))
+    ;; the numbers are this instance's
+    (.clear kw-ids)
+    (.clear sym-ids)
+    (set! kws (array))
+    (set! syms (array))
+    (set! mem-u8 (js/Uint8Array. 0))
+    (when (some? on-attach)
+      (on-attach))
     (set! stack-pointer (gobj/get exports "__stack_pointer"))
     (set! ds-call (gobj/get exports "ds_call"))
     ;; regular expressions are JavaScript's own
@@ -1027,9 +1144,9 @@
   (attach! (js/WebAssembly.Instance. (js/WebAssembly.Module. bytes) (imports))))
 
 (defn held
-  "How much the module holds for this host: {:dbs n :cursors n :fns n}, and what the host holds for it."
+  "How much the module holds for this host: {:dbs n :fns n}, and what the host holds for it."
   []
-  (let [[dbs cursors fns] (call op-held #js [])]
-    {:dbs dbs :cursors cursors :fns fns
+  (let [[dbs fns] (call op-held #js [])]
+    {:dbs dbs :fns fns
      :host-fns (.-size (.-by-value host-fns))
      :host-objs (.-size (.-by-value host-objs))}))

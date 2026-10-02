@@ -148,8 +148,10 @@
       (let [d (first ds)]
         (is (= [1 :n 1] [(.-e d) (.-a d) (.-v d)]))
         (is (= (inc d/tx0) (.-tx d)))))
-    (testing "a run that is read to its end, or let go of, holds nothing in the module"
-      (is (zero? (:cursors (wasm/held)))))))
+    (testing "a run that is read in parts, from where the part before ended"
+      (let [parts (take-while some? (iterate chunk-next (d/datoms db :eavt)))]
+        (is (< 3 (count parts)))
+        (is (= n (reduce + (map #(count (chunk-first %)) parts))))))))
 
 (deftest test-deep-values
   (let [depth 20000
@@ -208,5 +210,4 @@
                   (println "  handles before:" (pr-str before) "after:" (pr-str after))
                   (is (<= (:dbs after) (+ (:dbs before) 4)))
                   (is (<= (:host-fns after) (+ (:host-fns before) 2)))
-                  (is (<= (:cursors after) (:cursors before)))
                   (done))))))))))

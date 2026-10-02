@@ -161,44 +161,28 @@
 
 ;; ---------------------------------------------------------------- runs of datoms
 
-(declare ->DatomSeq)
+(declare ->DatomSeq datom-seq)
 
-;; What is left of a run of datoms in the module: a cursor there, read once, and what it read.
-(deftype More [^:mutable cursor ^:mutable fetched ^:mutable following])
+;; What is left of a run of datoms in the module: the operation that reads it and its arguments, the place to
+;; read on from among them. It is read once, and holds nothing in the module.
+(deftype More [op ^array args at ^:mutable fetched ^:mutable following])
 
-(def ^:private cursor-registry
-  (when (exists? js/FinalizationRegistry)
-    (js/FinalizationRegistry.
-      (fn [cursor]
-        (when (wasm/ready?)
-          (wasm/call wasm/op-cursor-free #js [cursor]))))))
-
-(def ^:const ^:private chunk-size 512)
-
-(defn- more-of [cursor]
-  (when (some? cursor)
-    (let [more (More. cursor false nil)]
-      (when (some? cursor-registry)
-        (.register cursor-registry more cursor more))
-      more)))
+(def ^:const ^:private max-chunk 1024)
 
 (defn- following
   "The run after the part already read: read from the module the first time it is asked for."
   [^More more]
   (when-not (.-fetched more)
-    (let [[datoms cursor] (wasm/call wasm/op-cursor-next #js [(.-cursor more) chunk-size])]
-      (when (some? cursor-registry)
-        (.unregister cursor-registry more))
-      (set! (.-fetched more) true)
-      (set! (.-cursor more) nil)
-      (set! (.-following more)
-        (when (pos? (count datoms))
-          (->DatomSeq datoms 0 (more-of cursor) nil nil)))))
+    (let [op   (.-op more)
+          args (.-args more)
+          at   (.-at more)]
+      (set! (.-following more) (datom-seq op args at (wasm/call op args) nil))
+      (set! (.-fetched more) true)))
   (.-following more))
 
 ;; A run of datoms, as a sequence: the part read so far, and where the rest is.
 ;; `reversed`, at the run's head, is a function that reads the same run from its other end.
-(deftype DatomSeq [chunk i ^More more reversed meta]
+(deftype DatomSeq [^array chunk i ^More more reversed meta]
   Object
   (toString [this] (pr-str* this))
   (equiv [this other] (-equiv this other))
@@ -207,22 +191,31 @@
   (-seq [this] this)
 
   ISeq
-  (-first [_] (-nth chunk i))
+  (-first [_] (aget chunk i))
   (-rest [this] (or (-next this) ()))
 
   INext
   (-next [_]
-    (if (< (inc i) (count chunk))
+    (if (< (inc i) (.-length chunk))
       (DatomSeq. chunk (inc i) more nil nil)
       (when (some? more)
         (following more))))
 
   IChunkedSeq
-  (-chunked-first [_] (array-chunk (to-array (subvec chunk i))))
+  (-chunked-first [_] (array-chunk chunk i (.-length chunk)))
   (-chunked-rest [_] (or (when (some? more) (following more)) ()))
 
   IChunkedNext
   (-chunked-next [_] (when (some? more) (following more)))
+
+  ICounted
+  (-count [_]
+    ;; what is read, and what is left in the module, counted there
+    (+ (- (.-length chunk) i)
+      (cond
+        (nil? more)      0
+        (.-fetched more) (count (.-following more))
+        :else            (wasm/call wasm/op-count-run #js [(.-op more) (.-args more)]))))
 
   ICollection
   (-conj [this o] (cons o this))
@@ -248,7 +241,7 @@
            more  more]
       (cond
         (reduced? acc) @acc
-        (< i (count chunk)) (recur (f acc (-nth chunk i)) chunk (inc i) more)
+        (< i (.-length chunk)) (recur (f acc (aget chunk i)) chunk (inc i) more)
         :else
         (if-some [^DatomSeq next (when (some? more) (following more))]
           (recur acc (.-chunk next) (.-i next) (.-more next))
@@ -273,11 +266,41 @@
 (es6-iterable DatomSeq)
 
 (defn- datom-seq
-  "What an operation that reads a run of datoms answers, [datoms cursor], as a sequence."
-  [answer reversed]
-  (let [datoms (nth answer 0)]
-    (when (pos? (count datoms))
-      (DatomSeq. datoms 0 (more-of (nth answer 1)) reversed nil))))
+  "What an operation that reads a run of datoms answers, [datoms place], as a sequence: the datoms, and, when
+  there is a place to read on from, the same operation with that place and room for more at `at` among its
+  arguments, where how many to read, whether backwards and the place are."
+  [op ^array args at answer reversed]
+  (let [^array datoms (nth answer 0)
+        place         (nth answer 1)]
+    (when (pos? (.-length datoms))
+      (DatomSeq. datoms 0
+        (when (some? place)
+          (let [args (.slice args)]
+            (aset args at (min max-chunk (* 4 (aget args at))))
+            (aset args (+ at 2) place)
+            (More. op args at false nil)))
+        reversed nil))))
+
+(set! wasm/datoms-reader
+  (fn [d]
+    (let [n   (wasm/r-u32 d)
+          arr (make-array n)]
+      (loop [i 0]
+        (when (< i n)
+          (let [e   (wasm/r-zigzag d)
+                ;; an attribute is a keyword, but for the strings of DataScript's JavaScript API; a value is most
+                ;; often a number, a string or a keyword
+                tag (wasm/r-byte d)
+                a   (if (== tag wasm/t-kw) (wasm/r-keyword d) (wasm/r-tagged d tag))
+                tag (wasm/r-byte d)
+                v   (cond
+                      (== tag wasm/t-int) (wasm/r-zigzag d)
+                      (== tag wasm/t-kw)  (wasm/r-keyword d)
+                      :else               (wasm/r-tagged d tag))
+                tx  (wasm/r-zigzag d)]
+            (aset arr i (Datom. e a v tx 0 0))
+            (recur (inc i)))))
+      arr)))
 
 ;; ---------------------------------------------------------------- database values
 
@@ -309,23 +332,32 @@
       (.set schemas uid entry)
       entry)))
 
+;; How many datoms the first read of a run brings: of a run with an end, which is mostly read whole, more than of one
+;; that goes on to the end of the index, which is mostly read for its first few. The reads after bring four times
+;; as many each, up to max-chunk.
 (def ^:const ^:private first-chunk 64)
+(def ^:const ^:private first-chunk-seek 16)
+
+(defn- read-run
+  "A run of datoms, read by an operation whose arguments end in how many, whether backwards, and where from."
+  [op ^array args]
+  (let [at (- (.-length args) 3)]
+    (datom-seq op args at (wasm/call op args)
+      (fn []
+        (let [args (.slice args)]
+          (aset args at first-chunk)
+          (aset args (inc at) true)
+          (datom-seq op args at (wasm/call op args) nil))))))
 
 (defn- index-read [op db index c0 c1 c2 c3]
-  (datom-seq
-    (wasm/call op #js [db index c0 c1 c2 c3 first-chunk false])
-    #(datom-seq (wasm/call op #js [db index c0 c1 c2 c3 chunk-size true]) nil)))
+  (read-run op #js [db index c0 c1 c2 c3 (if (== op wasm/op-datoms) first-chunk first-chunk-seek) false nil]))
 
 (defn- range-read [db attr start end]
-  (datom-seq
-    (wasm/call wasm/op-index-range #js [db attr start end first-chunk false])
-    #(datom-seq (wasm/call wasm/op-index-range #js [db attr start end chunk-size true]) nil)))
+  (read-run wasm/op-index-range #js [db attr start end first-chunk false nil]))
 
 (defn- search-read [db pattern]
   (let [[e a v tx] pattern]
-    (datom-seq
-      (wasm/call wasm/op-search #js [db e a v tx chunk-size false])
-      #(datom-seq (wasm/call wasm/op-search #js [db e a v tx chunk-size true]) nil))))
+    (read-run wasm/op-search #js [db e a v tx first-chunk false nil])))
 
 ;; A database value: the handle of one in the module. `owner` is what holds the handle: when nothing
 ;; holds the owner any more, the module is told to let the database go.
@@ -486,8 +518,31 @@
             (when (wasm/ready?)
               (wasm/call wasm/op-release-db #js [handle]))))))))
 
+(declare db-of*)
+
+;; The database value named last, and its handle: a predicate of a filtered database is given the same one for every
+;; datom it is asked of.
+(def ^:private last-handle -1)
+(def ^:private last-db nil)
+
 (defn- db-of
   "The database value of a handle the module names: the one already held, when one is."
+  [handle uid max-eid max-tx filtered?]
+  (if (== handle last-handle)
+    last-db
+    (let [db (db-of* handle uid max-eid max-tx filtered?)]
+      (set! last-handle handle)
+      (set! last-db db)
+      db)))
+
+(set! wasm/on-attach
+  (fn []
+    (.clear held)
+    (.clear schemas)
+    (set! last-handle -1)
+    (set! last-db nil)))
+
+(defn- db-of*
   [handle uid max-eid max-tx filtered?]
   (let [entry (.get held handle)
         owner (when (some? entry)
@@ -656,11 +711,8 @@
     (entid-strict db eid)))
 
 (defn numeric-eid-exists? ^boolean [db eid]
-  ;; the first datom from the entity on, and no more: the cursor to the rest is given back
-  (let [[datoms cursor] (wasm/call wasm/op-seek-datoms #js [db :eavt eid nil nil nil 1 false])]
-    (when (some? cursor)
-      (wasm/call wasm/op-cursor-free #js [cursor]))
-    (= eid (some-> (first datoms) :e))))
+  ;; one datom of the entity's, if it has any
+  (pos? (.-length (nth (wasm/call wasm/op-datoms #js [db :eavt eid nil nil nil 1 false nil]) 0))))
 
 (defn find-datom [db index c0 c1 c2 c3]
   (wasm/call wasm/op-find-datom #js [db index c0 c1 c2 c3]))

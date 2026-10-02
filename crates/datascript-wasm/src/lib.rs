@@ -17,7 +17,8 @@
 //!
 //! - `ds_host_call(handle, ptr, len) -> status`: call the host's function of that handle with the encoded vector of
 //!   arguments at `ptr`; answer through `ds_reply(ptr, len)`, memory from `ds_alloc` that the module takes over, with
-//!   the value (status 0) or `[message data exception]` (status 1). The host may call `ds_call` while it is called.
+//!   the value (status 0) or `[message data exception]` (status 1); or, with no reply, answer `nil` (status 2), `false`
+//!   (3) or `true` (4). The host may call `ds_call` while it is called.
 //! - `ds_host_op(op, a, b) -> n`: what the module asks of the host's own values (`host::OP_*`).
 //! - `ds_host_release(kind, handle)`: the module lets go of one mention of a function (0) or value (1) of the host's.
 //! - `ds_host_random() -> f64`: in `[0, 1)`.
@@ -50,7 +51,9 @@ thread_local! {
 }
 
 fn set_result(bytes: Vec<u8>) {
-    RESULT.with(|r| *r.borrow_mut() = bytes);
+    // the answer before this one has been read: its buffer is written into again
+    let before = RESULT.with(|r| std::mem::replace(&mut *r.borrow_mut(), bytes));
+    codec::recycle(before);
 }
 
 fn init() {
@@ -105,19 +108,17 @@ pub unsafe extern "C" fn ds_call(op: u32, ptr: *mut u8, len: usize) -> u32 {
     let message = take(ptr, len);
     let args = Reader::new(&message).value();
     drop(message);
-    let answer = args.and_then(|args| ops::dispatch(op, args.as_seq().unwrap_or(&[])));
     let mut w = Writer::new();
-    let status = match &answer {
-        Ok(v) => {
-            w.value(v);
-            0
-        }
+    let status = match args.and_then(|args| ops::answer(op, args.as_seq().unwrap_or(&[]), &mut w)) {
+        Ok(()) => 0,
         Err(e) => {
-            w.value(&error_value(e));
+            // what was written of an answer that failed is not sent
+            w = Writer::new();
+            w.value(&error_value(&e));
             1
         }
     };
-    set_result(w.buf);
+    set_result(w.into_bytes());
     status
 }
 
@@ -138,6 +139,42 @@ pub extern "C" fn ds_result_len() -> usize {
 #[no_mangle]
 pub unsafe extern "C" fn ds_reply(ptr: *mut u8, len: usize) {
     host::set_reply(take(ptr, len));
+}
+
+/// The number of a keyword (kind 0) or a symbol (kind 1), from its name, `ns/name` in UTF-8: the module's for it for
+/// good, and what the name is written as in every message. `u32::MAX` of what is no name.
+///
+/// # Safety
+/// `ptr` is memory from `ds_alloc(len)`, written by the host, and not used by it again.
+#[no_mangle]
+pub unsafe extern "C" fn ds_intern(kind: u32, ptr: *mut u8, len: usize) -> u32 {
+    let name = take(ptr, len);
+    match (kind, std::str::from_utf8(&name)) {
+        (0, Ok(name)) => datascript::Keyword::parse(name).id(),
+        (1, Ok(name)) => datascript::Symbol::parse(name).id(),
+        _ => u32::MAX,
+    }
+}
+
+/// A number's name: the keyword's (kind 0) or the symbol's (kind 1) `ns/name`, which stays where it is.
+fn name_of(kind: u32, id: u32) -> Option<&'static str> {
+    match kind {
+        0 => datascript::Keyword::from_id(id).map(|k| k.full_static()),
+        1 => datascript::Symbol::from_id(id).map(|s| s.full_static()),
+        _ => None,
+    }
+}
+
+/// Where the name of a number is, in UTF-8; null when no name has the number.
+#[no_mangle]
+pub extern "C" fn ds_name_ptr(kind: u32, id: u32) -> *const u8 {
+    name_of(kind, id).map_or(std::ptr::null(), str::as_ptr)
+}
+
+/// How many bytes long the name of a number is.
+#[no_mangle]
+pub extern "C" fn ds_name_len(kind: u32, id: u32) -> usize {
+    name_of(kind, id).map_or(0, str::len)
 }
 
 /// Puts the module back in order after a call that did not return: one the host's stack ran out under, or one

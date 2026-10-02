@@ -1,5 +1,6 @@
 //! The operations of `ds_call`: each takes a vector of arguments and answers a value.
 
+use crate::codec::{Writer, VECTOR};
 use crate::host;
 use crate::state::with_state;
 use datascript::built_ins;
@@ -27,18 +28,19 @@ pub const Q: u32 = 7;
 pub const PULL: u32 = 8;
 /// `[db pattern eids visitor]` → vector
 pub const PULL_MANY: u32 = 9;
-/// `[db index c0 c1 c2 c3 n reverse?]` → `[datoms cursor]`: the first `n` datoms, and a cursor if there may be more
+/// `[db index c0 c1 c2 c3 n reverse? place]` → `[datoms place]`: at most `n` datoms, as a run (`codec::DATOMS`), from
+/// the start or from the place a call before answered; and the place to read on from, `nil` at the end. A place is
+/// good for the same arguments again, and holds nothing in the module.
 pub const DATOMS: u32 = 10;
 pub const SEEK_DATOMS: u32 = 11;
 pub const RSEEK_DATOMS: u32 = 12;
-/// `[db attr start end n reverse?]` → `[datoms cursor]`
+/// `[db attr start end n reverse? place]` → `[datoms place]`
 pub const INDEX_RANGE: u32 = 13;
-/// `[db e a v tx n reverse?]` → `[datoms cursor]`: `-search`, each component `nil` when open
+/// `[db e a v tx n reverse? place]` → `[datoms place]`: `-search`, each component `nil` when open
 pub const SEARCH: u32 = 14;
-/// `[cursor n]` → `[datoms cursor]`: the cursor answered is the one to ask next, `nil` at the end
-pub const CURSOR_NEXT: u32 = 15;
-/// `[cursor]`
-pub const CURSOR_FREE: u32 = 16;
+/// `[read arguments]` → how many datoms a read (`DATOMS` … `SEARCH`) with those arguments has from its place on: a
+/// run counted where it is, and not read to be counted
+pub const COUNT_RUN: u32 = 15;
 /// `[db index c0 c1 c2 c3]` → datom or nil
 pub const FIND_DATOM: u32 = 17;
 /// `[db eid]` → the entity's id, or nil
@@ -67,7 +69,7 @@ pub const RELEASE_DB: u32 = 28;
 pub const RELEASE_FN: u32 = 29;
 /// `[f args]` → `(apply f args)`
 pub const CALL_FN: u32 = 30;
-/// `[]` → `[databases cursors functions]` held for the host
+/// `[]` → `[databases functions]` held for the host
 pub const HELD: u32 = 31;
 /// `[value]` → as ClojureScript prints it
 pub const PR_STR: u32 = 32;
@@ -118,17 +120,99 @@ fn datoms_value(datoms: Vec<Datom>) -> Value {
     Value::vector(datoms.into_iter().map(|d| Value::Datom(Arc::new(d))).collect())
 }
 
-/// The first `n` of a run of datoms, and a cursor to read on from when there may be more.
-fn first_chunk(datoms: Datoms, n: usize, reverse: bool) -> Result<Value> {
-    let datoms = if reverse { datoms.reversed() } else { datoms };
-    let mut cursor = datoms.cursor();
-    let chunk = datoms.next_chunk(&mut cursor, n)?;
-    let more = if cursor.is_done() || chunk.len() < n {
-        Value::Nil
-    } else {
-        Value::from(with_state(|state| state.insert_cursor((datoms, cursor))) as usize)
+/// Writes `[datoms place]`: at most `n` of a run of datoms, from its start or from a place answered before, and
+/// the place to read on from when there may be more.
+fn write_chunk(w: &mut Writer, datoms: Datoms, n: &Value, reverse: &Value, place: &Value) -> Result<()> {
+    let datoms = if reverse.truthy() { datoms.reversed() } else { datoms };
+    let n = count_arg(n);
+    let mut cursor = match place.as_seq() {
+        None => datoms.cursor(),
+        Some(path) => {
+            let path: Vec<u16> = path.iter().map(|p| p.as_num().unwrap_or(-1.0) as u16).collect();
+            datoms.cursor_at(&path)?
+        }
     };
-    Ok(vector![datoms_value(chunk), more])
+    w.count(VECTOR, 2);
+    let run = w.datoms_begin();
+    let count = datoms.for_chunk(&mut cursor, n, |d| w.datom_of_run(d))?;
+    w.datoms_end(run, count);
+    if cursor.is_done() || count < n {
+        w.byte(crate::codec::NIL);
+    } else {
+        let path = cursor.place();
+        w.count(VECTOR, path.len());
+        for p in path {
+            w.number(*p as f64);
+        }
+    }
+    Ok(())
+}
+
+/// The run of datoms a read finds, for the operations that answer one: `None` of any other operation. With it,
+/// where its `n`, `reverse?` and `place` are among the arguments.
+fn found(op: u32, args: &[Value]) -> Option<Result<(Datoms, usize)>> {
+    Some(match op {
+        DATOMS | SEEK_DATOMS | RSEEK_DATOMS => (|| {
+            let db = db_arg(args, 0)?;
+            let index = index_arg(arg(args, 1))?;
+            let (c0, c1, c2, c3) = (arg(args, 2), arg(args, 3), arg(args, 4), arg(args, 5));
+            let found = match op {
+                DATOMS => db::datoms(&db, index, c0, c1, c2, c3)?,
+                SEEK_DATOMS => db::seek_datoms(&db, index, c0, c1, c2, c3)?,
+                _ => db::rseek_datoms(&db, index, c0, c1, c2, c3)?,
+            };
+            Ok((found, 6))
+        })(),
+        INDEX_RANGE => (|| Ok((db::index_range(&db_arg(args, 0)?, arg(args, 1), arg(args, 2), arg(args, 3))?, 4)))(),
+        SEARCH => (|| {
+            let db = db_arg(args, 0)?;
+            // as `-search` reads its pattern: what is nil or false is left open
+            let open = |v: &Value| !v.truthy();
+            let id = |v: &Value| -> Result<Option<i32>> {
+                match v.as_num() {
+                    _ if open(v) => Ok(None),
+                    Some(n) => id_from_num(n).map(Some),
+                    None => Err(Error::msg(format!("Cannot compare {} to an id", datascript::print::str_of(v)))),
+                }
+            };
+            let (e, tx) = match (id(arg(args, 1)), id(arg(args, 4))) {
+                (Ok(e), Ok(tx)) => (e, tx),
+                // no datom has an id that is a fraction
+                (Err(err), _) | (_, Err(err)) => {
+                    return if err.data.is_nil() && arg(args, 1).as_num().or(arg(args, 4).as_num()).is_some() {
+                        Ok((Datoms::empty(), 5))
+                    } else {
+                        Err(err)
+                    };
+                }
+            };
+            let a = arg(args, 2);
+            let attr = if open(a) {
+                None
+            } else {
+                Some(value_attr(a).ok_or_else(|| {
+                    Error::msg(format!("Cannot compare {} to an attribute", datascript::print::str_of(a)))
+                })?)
+            };
+            let v = Some(arg(args, 3)).filter(|v| v.is_some());
+            Ok((db::search(&db, e, attr.as_ref(), v, tx), 5))
+        })(),
+        _ => return None,
+    })
+}
+
+/// One operation, its answer written: a run of datoms as it is read, anything else as its value.
+pub fn answer(op: u32, args: &[Value], w: &mut Writer) -> Result<()> {
+    match found(op, args) {
+        Some(found) => {
+            let (datoms, at) = found?;
+            write_chunk(w, datoms, arg(args, at), arg(args, at + 1), arg(args, at + 2))
+        }
+        None => {
+            w.value(&dispatch(op, args)?);
+            Ok(())
+        }
+    }
 }
 
 /// A function of the host's that a database's filter asks of every datom.
@@ -207,71 +291,20 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
             let ids = datascript::clj::seq(arg(args, 2))?;
             Value::vector(datascript::pull_many(&db_arg(args, 0)?, arg(args, 1), &ids, visitor)?)
         }
-        DATOMS | SEEK_DATOMS | RSEEK_DATOMS => {
-            let db = db_arg(args, 0)?;
-            let index = index_arg(arg(args, 1))?;
-            let (c0, c1, c2, c3) = (arg(args, 2), arg(args, 3), arg(args, 4), arg(args, 5));
-            let found = match op {
-                DATOMS => db::datoms(&db, index, c0, c1, c2, c3)?,
-                SEEK_DATOMS => db::seek_datoms(&db, index, c0, c1, c2, c3)?,
-                _ => db::rseek_datoms(&db, index, c0, c1, c2, c3)?,
-            };
-            first_chunk(found, count_arg(arg(args, 6)), arg(args, 7).truthy())?
-        }
-        INDEX_RANGE => {
-            let found = db::index_range(&db_arg(args, 0)?, arg(args, 1), arg(args, 2), arg(args, 3))?;
-            first_chunk(found, count_arg(arg(args, 4)), arg(args, 5).truthy())?
-        }
-        SEARCH => {
-            let db = db_arg(args, 0)?;
-            // as `-search` reads its pattern: what is nil or false is left open
-            let open = |v: &Value| !v.truthy();
-            let id = |v: &Value| -> Result<Option<i32>> {
-                match v.as_num() {
-                    _ if open(v) => Ok(None),
-                    Some(n) => id_from_num(n).map(Some),
-                    None => Err(Error::msg(format!("Cannot compare {} to an id", datascript::print::str_of(v)))),
+        COUNT_RUN => {
+            let read = handle_arg(arg(args, 0))?;
+            let of = datascript::clj::seq(arg(args, 1))?;
+            let (datoms, at) =
+                found(read, &of).ok_or_else(|| Error::msg("datascript: not an operation that reads datoms"))??;
+            let datoms = if arg(&of, at + 1).truthy() { datoms.reversed() } else { datoms };
+            let mut cursor = match arg(&of, at + 2).as_seq() {
+                None => datoms.cursor(),
+                Some(path) => {
+                    let path: Vec<u16> = path.iter().map(|p| p.as_num().unwrap_or(-1.0) as u16).collect();
+                    datoms.cursor_at(&path)?
                 }
             };
-            let (e, tx) = match (id(arg(args, 1)), id(arg(args, 4))) {
-                (Ok(e), Ok(tx)) => (e, tx),
-                // no datom has an id that is a fraction
-                (Err(err), _) | (_, Err(err)) => {
-                    return if err.data.is_nil() && arg(args, 1).as_num().or(arg(args, 4).as_num()).is_some() {
-                        Ok(vector![Value::vector(Vec::new()), Value::Nil])
-                    } else {
-                        Err(err)
-                    };
-                }
-            };
-            let a = arg(args, 2);
-            let attr = if open(a) {
-                None
-            } else {
-                Some(value_attr(a).ok_or_else(|| {
-                    Error::msg(format!("Cannot compare {} to an attribute", datascript::print::str_of(a)))
-                })?)
-            };
-            let v = Some(arg(args, 3)).filter(|v| v.is_some());
-            let found = db::search(&db, e, attr.as_ref(), v, tx);
-            first_chunk(found, count_arg(arg(args, 5)), arg(args, 6).truthy())?
-        }
-        CURSOR_NEXT => {
-            let handle = handle_arg(arg(args, 0))?;
-            let (datoms, mut cursor) = with_state(|state| state.take_cursor(handle))
-                .ok_or_else(|| Error::msg(format!("datascript: no cursor of handle {handle}")))?;
-            let n = count_arg(arg(args, 1));
-            let chunk = datoms.next_chunk(&mut cursor, n)?;
-            let more = if cursor.is_done() || chunk.len() < n {
-                Value::Nil
-            } else {
-                Value::from(with_state(|state| state.insert_cursor((datoms, cursor))) as usize)
-            };
-            vector![datoms_value(chunk), more]
-        }
-        CURSOR_FREE => {
-            let freed = with_state(|state| state.take_cursor(handle_arg(arg(args, 0)).unwrap_or(0)));
-            Value::Bool(freed.is_some())
+            Value::from(datoms.for_chunk(&mut cursor, usize::MAX, |_| ())?)
         }
         FIND_DATOM => {
             let found = db::find_datom(
@@ -328,8 +361,8 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
         }
         CALL_FN => built_ins::call(arg(args, 0), &datascript::clj::seq(arg(args, 1))?)?,
         HELD => {
-            let (dbs, cursors, fns) = with_state(|state| state.held());
-            vector![dbs, cursors, fns]
+            let (dbs, fns) = with_state(|state| state.held());
+            vector![dbs, fns]
         }
         PR_STR => Value::from(datascript::print::pr_str(arg(args, 0))),
         READ_STRING => {

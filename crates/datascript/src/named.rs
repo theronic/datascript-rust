@@ -1,5 +1,6 @@
 //! Keywords, symbols and attributes. Each is interned: two with the same name are the same allocation, so equality is
-//! a pointer comparison, and the ClojureScript hash is computed once.
+//! a pointer comparison, and the ClojureScript hash is computed once. A name is kept for as long as the program runs,
+//! as ClojureScript keeps its keywords, so a keyword is a pointer that is copied, and copying a datom counts nothing.
 
 use crate::hash;
 use std::cmp::Ordering;
@@ -17,6 +18,8 @@ enum Kind {
 
 pub struct Named {
     kind: Kind,
+    /// Its number among the names of its kind, in the order they were first met
+    id: u32,
     ns: Option<Box<str>>,
     name: Box<str>,
     /// `ns/name`, or the name alone
@@ -24,7 +27,14 @@ pub struct Named {
     hash: i32,
 }
 
-type Table = Mutex<HashMap<Arc<str>, Arc<Named>>>;
+/// The names of one kind: by `ns/name`, and by number.
+#[derive(Default)]
+struct Names {
+    by_name: HashMap<Arc<str>, &'static Named>,
+    by_id: Vec<&'static Named>,
+}
+
+type Table = Mutex<Names>;
 
 fn table(kind: Kind) -> &'static Table {
     static KEYWORDS: OnceLock<Table> = OnceLock::new();
@@ -49,10 +59,10 @@ fn split(full: &str) -> (Option<&str>, &str) {
     }
 }
 
-fn intern(kind: Kind, full: &str) -> Arc<Named> {
+fn intern(kind: Kind, full: &str) -> &'static Named {
     let mut t = table(kind).lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(n) = t.get(full) {
-        return n.clone();
+    if let Some(n) = t.by_name.get(full) {
+        return n;
     }
     let (ns, name) = match kind {
         Kind::Str => (None, full),
@@ -64,12 +74,19 @@ fn intern(kind: Kind, full: &str) -> Arc<Named> {
         Kind::Str => hash::hash_string(full),
     };
     let full: Arc<str> = Arc::from(full);
-    let named = Arc::new(Named { kind, ns: ns.map(Box::from), name: Box::from(name), full: full.clone(), hash });
-    t.insert(full, named.clone());
+    let id = t.by_id.len() as u32;
+    let named: &'static Named =
+        Box::leak(Box::new(Named { kind, id, ns: ns.map(Box::from), name: Box::from(name), full: full.clone(), hash }));
+    t.by_name.insert(full, named);
+    t.by_id.push(named);
     named
 }
 
-fn intern_parts(kind: Kind, ns: Option<&str>, name: &str) -> Arc<Named> {
+fn by_id(kind: Kind, id: u32) -> Option<&'static Named> {
+    table(kind).lock().unwrap_or_else(|e| e.into_inner()).by_id.get(id as usize).copied()
+}
+
+fn intern_parts(kind: Kind, ns: Option<&str>, name: &str) -> &'static Named {
     match ns {
         Some(ns) if !ns.is_empty() => {
             let mut full = String::with_capacity(ns.len() + 1 + name.len());
@@ -86,10 +103,23 @@ fn intern_parts(kind: Kind, ns: Option<&str>, name: &str) -> Arc<Named> {
 /// JavaScript's string order (`goog.array.defaultCompare` on strings): by UTF-16 code units. It differs from the
 /// order of UTF-8 bytes only where a character above U+FFFF meets one in U+E000..U+FFFF.
 pub fn compare_str(a: &str, b: &str) -> Ordering {
-    if a.is_ascii() && b.is_ascii() {
-        return a.cmp(b);
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    match x.iter().zip(y).position(|(p, q)| p != q) {
+        None => x.len().cmp(&y.len()),
+        Some(i) => {
+            // Where the two first differ, both are at the same place in a character. A lead byte from 0xF0 is a
+            // character above U+FFFF, which UTF-16 writes as a pair of surrogates, below U+E000; 0xEE and 0xEF lead
+            // the characters from U+E000 to U+FFFF.
+            let (p, q) = (x[i], y[i]);
+            if p >= 0xF0 && (q == 0xEE || q == 0xEF) {
+                Ordering::Less
+            } else if q >= 0xF0 && (p == 0xEE || p == 0xEF) {
+                Ordering::Greater
+            } else {
+                p.cmp(&q)
+            }
+        }
     }
-    a.encode_utf16().cmp(b.encode_utf16())
 }
 
 /// `compare-keywords` and `compare-symbols`: a name without a namespace first, then by namespace, then by name.
@@ -105,8 +135,8 @@ fn compare_named(a: &Named, b: &Named) -> Ordering {
 macro_rules! named_type {
     ($(#[$meta:meta])* $ty:ident, $kind:expr) => {
         $(#[$meta])*
-        #[derive(Clone)]
-        pub struct $ty(pub(crate) Arc<Named>);
+        #[derive(Clone, Copy)]
+        pub struct $ty(pub(crate) &'static Named);
 
         impl $ty {
             /// From `ns/name`, or a name alone.
@@ -134,6 +164,12 @@ macro_rules! named_type {
                 &self.0.full
             }
 
+            /// `ns/name`, which is kept for as long as the program runs
+            #[inline]
+            pub fn full_static(&self) -> &'static str {
+                &self.0.full
+            }
+
             /// ClojureScript's hash of it
             #[inline]
             pub fn hash(&self) -> i32 {
@@ -142,14 +178,26 @@ macro_rules! named_type {
 
             #[inline]
             pub fn ptr(&self) -> usize {
-                Arc::as_ptr(&self.0) as usize
+                self.0 as *const Named as usize
+            }
+
+            /// Its number: the names of a kind are numbered from 0 in the order they are first met, and keep
+            /// their numbers. What knows the number knows the name without spelling it.
+            #[inline]
+            pub fn id(&self) -> u32 {
+                self.0.id
+            }
+
+            /// The name of a number, if one has it.
+            pub fn from_id(id: u32) -> Option<Self> {
+                by_id($kind, id).map($ty)
             }
         }
 
         impl PartialEq for $ty {
             #[inline]
             fn eq(&self, other: &Self) -> bool {
-                Arc::ptr_eq(&self.0, &other.0)
+                std::ptr::eq(self.0, other.0)
             }
         }
 
@@ -169,7 +217,7 @@ macro_rules! named_type {
 
         impl Ord for $ty {
             fn cmp(&self, other: &Self) -> Ordering {
-                if Arc::ptr_eq(&self.0, &other.0) {
+                if std::ptr::eq(self.0, other.0) {
                     Ordering::Equal
                 } else {
                     compare_named(&self.0, &other.0)
@@ -215,12 +263,12 @@ impl fmt::Debug for Symbol {
 }
 
 /// An attribute: a keyword, as ClojureScript names attributes, or a string, as DataScript's JavaScript API does.
-#[derive(Clone)]
-pub struct Attr(pub(crate) Arc<Named>);
+#[derive(Clone, Copy)]
+pub struct Attr(pub(crate) &'static Named);
 
 impl Attr {
     pub fn keyword(k: &Keyword) -> Attr {
-        Attr(k.0.clone())
+        Attr(k.0)
     }
 
     /// A keyword attribute, from `ns/name`.
@@ -240,7 +288,7 @@ impl Attr {
     #[inline]
     pub fn as_keyword(&self) -> Option<Keyword> {
         if self.is_keyword() {
-            Some(Keyword(self.0.clone()))
+            Some(Keyword(self.0))
         } else {
             None
         }
@@ -274,14 +322,14 @@ impl Attr {
 
     #[inline]
     pub fn ptr(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
+        self.0 as *const Named as usize
     }
 }
 
 impl PartialEq for Attr {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        std::ptr::eq(self.0, other.0)
     }
 }
 
@@ -304,7 +352,7 @@ impl PartialOrd for Attr {
 impl Ord for Attr {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        if Arc::ptr_eq(&self.0, &other.0) {
+        if std::ptr::eq(self.0, other.0) {
             return Ordering::Equal;
         }
         match (self.0.kind, other.0.kind) {

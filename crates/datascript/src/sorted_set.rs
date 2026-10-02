@@ -66,6 +66,23 @@ pub struct Pos {
     path: [u16; MAX_DEPTH],
 }
 
+impl Pos {
+    /// The place as numbers, for a caller that keeps it outside the program and hands it back (`SortedSet::has`).
+    pub fn path(&self) -> &[u16] {
+        let used = self.path.iter().rposition(|p| *p != 0).map_or(0, |i| i + 1);
+        &self.path[..used]
+    }
+
+    pub fn from_path(path: &[u16]) -> Option<Pos> {
+        if path.len() > MAX_DEPTH {
+            return None;
+        }
+        let mut p = [0u16; MAX_DEPTH];
+        p[..path.len()].copy_from_slice(path);
+        Some(Pos { path: p })
+    }
+}
+
 impl PartialOrd for Pos {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -250,6 +267,23 @@ impl<T: Clone> SortedSet<T> {
             }
         }
         None
+    }
+
+    /// Whether a place is one of this set's: an element's, or the one after a leaf's last. A place that was handed
+    /// out is checked before it is trusted again.
+    pub fn has(&self, pos: &Pos) -> bool {
+        let mut node = &*self.root;
+        for level in 0..MAX_DEPTH {
+            let i = pos.path[level] as usize;
+            match node {
+                Node::Leaf(items) => return i <= items.len() && pos.path[level + 1..].iter().all(|p| *p == 0),
+                Node::Branch { children, .. } => match children.get(i) {
+                    Some(child) => node = child,
+                    None => return false,
+                },
+            }
+        }
+        false
     }
 
     /// The elements from one place up to another.
@@ -509,6 +543,11 @@ impl<T: Clone> Slice<T> {
     /// The place of the run's first element, and the place after its last.
     pub fn bounds(&self) -> (Pos, Pos) {
         (self.from, self.to)
+    }
+
+    /// Whether a place is one of the set's this run is of.
+    pub fn has(&self, pos: &Pos) -> bool {
+        self.set.has(pos)
     }
 
     /// The run from a place in it on: where an iteration that stopped goes on.

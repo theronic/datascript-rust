@@ -253,14 +253,32 @@ impl Datoms {
         Cursor { pos: if self.rev { to } else { from }, done: self.slice.is_empty() }
     }
 
+    /// A cursor at a place one of these datoms' cursors was at (`Cursor::place`): where a caller that read a part
+    /// and kept the place reads on, with the same datoms found again.
+    pub fn cursor_at(&self, place: &[u16]) -> Result<Cursor> {
+        let pos = crate::sorted_set::Pos::from_path(place)
+            .filter(|pos| self.slice.has(pos))
+            .ok_or_else(|| Error::msg("datascript: no such place in the index"))?;
+        Ok(Cursor { pos, done: false })
+    }
+
     /// The next datoms from a cursor, at most `n`, which moves the cursor past them. An empty answer is the end.
     pub fn next_chunk(&self, cursor: &mut Cursor, n: usize) -> Result<Vec<Datom>> {
-        self.check()?;
         let mut out = Vec::new();
+        self.for_chunk(cursor, n, |d| out.push(d.clone()))?;
+        Ok(out)
+    }
+
+    /// The next datoms from a cursor, at most `n`, each given to `f` where it lies; the cursor moves past them. How
+    /// many there were: none is the end.
+    pub fn for_chunk(&self, cursor: &mut Cursor, n: usize, mut f: impl FnMut(&Datom)) -> Result<usize> {
+        self.check()?;
+        let mut count = 0;
         if cursor.done || n == 0 {
-            return Ok(out);
+            return Ok(count);
         }
         let plain = self.unfiltered();
+        let (from, to) = self.slice.bounds();
         if self.rev {
             let mut it = self.slice.iter_rev_from(cursor.pos);
             loop {
@@ -271,8 +289,9 @@ impl Datoms {
                     }
                     Some(d) => {
                         if plain || self.keep(d)? {
-                            out.push(d.clone());
-                            if out.len() == n {
+                            f(d);
+                            count += 1;
+                            if count == n {
                                 break;
                             }
                         }
@@ -280,6 +299,7 @@ impl Datoms {
                 }
             }
             cursor.pos = it.pos();
+            cursor.done |= cursor.pos <= from;
         } else {
             let mut it = self.slice.iter_from(cursor.pos);
             loop {
@@ -290,8 +310,9 @@ impl Datoms {
                     }
                     Some(d) => {
                         if plain || self.keep(d)? {
-                            out.push(d.clone());
-                            if out.len() == n {
+                            f(d);
+                            count += 1;
+                            if count == n {
                                 break;
                             }
                         }
@@ -299,8 +320,9 @@ impl Datoms {
                 }
             }
             cursor.pos = it.pos();
+            cursor.done |= cursor.pos >= to;
         }
-        Ok(out)
+        Ok(count)
     }
 }
 
@@ -314,6 +336,11 @@ pub struct Cursor {
 impl Cursor {
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// The place as numbers, which `Datoms::cursor_at` makes a cursor of again.
+    pub fn place(&self) -> &[u16] {
+        self.pos.path()
     }
 }
 

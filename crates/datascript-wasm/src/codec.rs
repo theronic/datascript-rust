@@ -1,8 +1,8 @@
 //! The form values cross the module's boundary in: a tag byte, then what the tag says follows. Integers are
 //! LEB128 varints, signed ones zigzagged; strings are their length in bytes and UTF-8.
 //!
-//! Keywords and symbols are named once in a message and numbered after: `KW_DEF` gives the next number its name,
-//! `KW_REF` is a number alone. Every message numbers its own, from 0, in the order they are first written.
+//! A keyword or a symbol is its number: the module numbers every name it meets, for good, and a host learns a
+//! name's number, or a number's name, once, by asking (`ds_intern`, `ds_name_ptr`, `ds_name_len`).
 //!
 //! A map or a set says which of ClojureScript's two shapes it has, since that is what its order of iteration is:
 //! `ARRAY_*` keeps the order its entries come in, `HASH_*` is ordered by its keys' hashes.
@@ -12,7 +12,6 @@ use datascript::coll::{CljMap, CljSet};
 use datascript::datom::value_attr;
 use datascript::value::Regex;
 use datascript::{Datom, Error, Keyword, Result, Symbol, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub const NIL: u8 = 0;
@@ -23,11 +22,11 @@ pub const INT: u8 = 3;
 /// Any other number: 8 bytes, little-endian
 pub const F64: u8 = 4;
 pub const STR: u8 = 5;
-/// name: the keyword, which is the next number for the rest of the message
-pub const KW_DEF: u8 = 6;
-pub const KW_REF: u8 = 7;
-pub const SYM_DEF: u8 = 8;
-pub const SYM_REF: u8 = 9;
+/// A keyword: its number, which is the module's for it for good (`ds_intern` gives a name's number, `ds_name_ptr`
+/// and `ds_name_len` a number's name)
+pub const KW: u8 = 6;
+/// A symbol: its number, likewise
+pub const SYM: u8 = 8;
 /// count, elements
 pub const VECTOR: u8 = 10;
 pub const LIST: u8 = 11;
@@ -57,11 +56,12 @@ pub const MODULE_FN: u8 = 23;
 pub const DB_INFO: u8 = 24;
 /// a type, as `type` answers one: its name, which the host has the constructor of
 pub const TYPE: u8 = 25;
+/// a run of datoms, as the module answers an index read with: how many (4 bytes, little-endian), then of each its
+/// e (zigzag), a, v, and tx (zigzag), which is negative for a datom that was retracted
+pub const DATOMS: u8 = 26;
 
 pub struct Writer {
     pub buf: Vec<u8>,
-    keywords: HashMap<Keyword, u32>,
-    symbols: HashMap<Symbol, u32>,
 }
 
 impl Default for Writer {
@@ -70,9 +70,42 @@ impl Default for Writer {
     }
 }
 
+thread_local! {
+    /// What writers wrote into, kept for the next: a call writes at least one message, and a query that asks the
+    /// host of every row writes one a row.
+    static SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A buffer that held a message, for a writer to come. Large ones are let go.
+pub fn recycle(mut buf: Vec<u8>) {
+    if buf.capacity() < 64 || buf.capacity() > 1 << 16 {
+        return;
+    }
+    buf.clear();
+    // not kept as a thread ends, when there is nowhere to keep it
+    let _ = SPARE.try_with(|spare| {
+        let mut spare = spare.borrow_mut();
+        if spare.len() < 8 {
+            spare.push(buf);
+        }
+    });
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        recycle(std::mem::take(&mut self.buf));
+    }
+}
+
 impl Writer {
     pub fn new() -> Writer {
-        Writer { buf: Vec::with_capacity(256), keywords: HashMap::new(), symbols: HashMap::new() }
+        let buf = SPARE.try_with(|spare| spare.borrow_mut().pop()).ok().flatten();
+        Writer { buf: buf.unwrap_or_else(|| Vec::with_capacity(256)) }
+    }
+
+    /// What was written, which is the caller's from here on.
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
     }
 
     #[inline]
@@ -117,19 +150,35 @@ impl Writer {
         }
     }
 
+    #[inline]
     pub fn keyword(&mut self, k: &Keyword) {
-        match self.keywords.get(k) {
-            Some(id) => {
-                let id = *id;
-                self.byte(KW_REF);
-                self.varint(id as u64);
-            }
+        self.byte(KW);
+        self.varint(k.id() as u64);
+    }
+
+    /// Begins a run of datoms: where its count goes, once it is known (`datoms_end`).
+    pub fn datoms_begin(&mut self) -> usize {
+        self.byte(DATOMS);
+        self.buf.extend_from_slice(&[0; 4]);
+        self.buf.len() - 4
+    }
+
+    /// One datom of a run.
+    pub fn datom_of_run(&mut self, d: &Datom) {
+        self.zigzag(d.e as i64);
+        match d.a.as_keyword() {
+            Some(k) => self.keyword(&k),
             None => {
-                self.keywords.insert(k.clone(), self.keywords.len() as u32);
-                self.byte(KW_DEF);
-                self.str(k.full());
+                self.byte(STR);
+                self.str(d.a.full());
             }
         }
+        self.value(&d.v);
+        self.zigzag(if d.added() { d.tx() as i64 } else { -(d.tx() as i64) });
+    }
+
+    pub fn datoms_end(&mut self, begun: usize, count: usize) {
+        self.buf[begun..begun + 4].copy_from_slice(&(count as u32).to_le_bytes());
     }
 
     /// A value. One nested thousands deep, as a recursive pull makes, is written from a list of what is still to
@@ -163,18 +212,10 @@ impl Writer {
                 self.str(s);
             }
             Value::Keyword(k) => self.keyword(k),
-            Value::Symbol(s) => match self.symbols.get(s) {
-                Some(id) => {
-                    let id = *id;
-                    self.byte(SYM_REF);
-                    self.varint(id as u64);
-                }
-                None => {
-                    self.symbols.insert(s.clone(), self.symbols.len() as u32);
-                    self.byte(SYM_DEF);
-                    self.str(s.full());
-                }
-            },
+            Value::Symbol(s) => {
+                self.byte(SYM);
+                self.varint(s.id() as u64);
+            }
             Value::Vector(_) | Value::List(_) | Value::Map(_) | Value::Set(_) => return false,
             Value::Uuid(s) => {
                 self.byte(UUID);
@@ -301,8 +342,6 @@ enum Todo<'a> {
 pub struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
-    keywords: Vec<Keyword>,
-    symbols: Vec<Symbol>,
 }
 
 fn truncated() -> Error {
@@ -311,7 +350,7 @@ fn truncated() -> Error {
 
 impl<'a> Reader<'a> {
     pub fn new(bytes: &'a [u8]) -> Reader<'a> {
-        Reader { bytes, pos: 0, keywords: Vec::new(), symbols: Vec::new() }
+        Reader { bytes, pos: 0 }
     }
 
     pub fn is_done(&self) -> bool {
@@ -392,30 +431,13 @@ impl<'a> Reader<'a> {
             INT => Value::Num(self.zigzag()? as f64),
             F64 => Value::Num(self.f64()?),
             STR => Value::str(self.str()?),
-            KW_DEF => {
-                let k = Keyword::parse(self.str()?);
-                self.keywords.push(k.clone());
-                Value::Keyword(k)
+            KW => {
+                let id = self.varint()? as u32;
+                Value::Keyword(Keyword::from_id(id).ok_or_else(|| Error::msg("datascript: no keyword of that number"))?)
             }
-            KW_REF => {
-                let id = self.varint()? as usize;
-                Value::Keyword(
-                    self.keywords
-                        .get(id)
-                        .cloned()
-                        .ok_or_else(|| Error::msg("datascript: no keyword of that number"))?,
-                )
-            }
-            SYM_DEF => {
-                let sym = Symbol::parse(self.str()?);
-                self.symbols.push(sym.clone());
-                Value::Symbol(sym)
-            }
-            SYM_REF => {
-                let id = self.varint()? as usize;
-                Value::Symbol(
-                    self.symbols.get(id).cloned().ok_or_else(|| Error::msg("datascript: no symbol of that number"))?,
-                )
+            SYM => {
+                let id = self.varint()? as u32;
+                Value::Symbol(Symbol::from_id(id).ok_or_else(|| Error::msg("datascript: no symbol of that number"))?)
             }
             VECTOR | LIST | ARRAY_SET | HASH_SET => {
                 let left = self.varint()? as usize;
