@@ -1,12 +1,13 @@
 //! The steps of a case, as conformance/oracle/src/oracle/core.cljs runs them, printed as it prints them.
 
 use crate::fns;
+use datascript::built_ins::call;
 use datascript::cmp::value_compare;
 use datascript::coll::CljMap;
 use datascript::datom::datom_from_reader;
 use datascript::print::{pr_str, str_of};
-use datascript::value::{HostObj, HostObject};
-use datascript::{clj, edn, Datom, Db, Error, Index, Result, Value};
+use datascript::value::{Func, HostObj, HostObject};
+use datascript::{clj, edn, vector, Datom, Db, Entity, Error, Index, Result, Value};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -226,6 +227,174 @@ fn run_step(env: &Env, step: &Value) -> Result<(String, Value)> {
             let db = db_arg(&arg("db")?)?.with_schema(arg("schema")?)?;
             (db_line(&db)?, Value::Db(db))
         }
+        "filter" => {
+            let db = db_arg(&arg("db")?)?;
+            let pred = arg("pred")?;
+            let filtered = db.filter(Arc::new(move |db, datom| {
+                Ok(call(&pred, &[Value::Db(db.clone()), datom_value(datom.clone())])?.truthy())
+            }));
+            (db_line(&filtered)?, Value::Db(filtered))
+        }
+        "q" => {
+            let inputs = seq_arg(&arg("inputs")?)?;
+            let r = datascript::q(&arg("query")?, &inputs)?;
+            (p(&r), r)
+        }
+        "q-count" | "pull-count" => {
+            // a query over the database behind a filter that passes everything and counts what it is asked
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = count.clone();
+            let db = db_arg(&arg("db")?)?.filter(Arc::new(move |_, _| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(true)
+            }));
+            let r = if op == "q-count" {
+                let mut inputs = vec![Value::Db(db)];
+                inputs.extend(seq_arg(&arg("inputs")?)?);
+                datascript::q(&arg("query")?, &inputs)?
+            } else {
+                datascript::pull(&db, &arg("pattern")?, &arg("eid")?, None)?
+            };
+            let n = count.load(std::sync::atomic::Ordering::Relaxed);
+            (p(&vector![n, r.clone()]), r)
+        }
+        "pull" => {
+            let r = datascript::pull(&db_arg(&arg("db")?)?, &arg("pattern")?, &arg("eid")?, None)?;
+            (p(&r), r)
+        }
+        "pull-depth" => {
+            // how deep a pull went along one attribute, and what it found there: too deep to print whole
+            let r = datascript::pull(&db_arg(&arg("db")?)?, &arg("pattern")?, &arg("eid")?, None)?;
+            let key = arg("key")?;
+            let (mut depth, mut node) = (0usize, r.clone());
+            loop {
+                let next = clj::get(&node, &key).and_then(|v| clj::get(&v, &Value::from(0)));
+                match next {
+                    Some(next) => {
+                        depth += 1;
+                        node = next;
+                    }
+                    None => break,
+                }
+            }
+            (p(&vector![depth, node]), nothing)
+        }
+        "pull-many" => {
+            let ids = seq_arg(&arg("eids")?)?;
+            let r = Value::vector(datascript::pull_many(&db_arg(&arg("db")?)?, &arg("pattern")?, &ids, None)?);
+            (p(&r), r)
+        }
+        "pull-visit" => {
+            let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+            let log = seen.clone();
+            let visitor = Value::Fn(Func::new("visitor", move |args| {
+                log.lock().unwrap().push(Value::vector(args.to_vec()));
+                Ok(Value::Nil)
+            }));
+            let r = datascript::pull(&db_arg(&arg("db")?)?, &arg("pattern")?, &arg("eid")?, Some(&visitor))?;
+            let mut m = CljMap::new();
+            m.assoc(kwv("result"), r.clone());
+            m.assoc(kwv("visited"), Value::vector(seen.lock().unwrap().clone()));
+            (p(&Value::map(m)), r)
+        }
+        "entity" => {
+            let e = datascript::entity(&db_arg(&arg("db")?)?, &arg("eid")?)?;
+            let attrs = seq_arg(&arg("attrs")?)?;
+            let touch = raw("touch").truthy();
+            let view = match e {
+                None => Value::Nil,
+                Some(e) => {
+                    let mut vals = Vec::with_capacity(attrs.len());
+                    for a in &attrs {
+                        vals.push(e.lookup(a)?.unwrap_or(Value::Nil));
+                    }
+                    if touch {
+                        e.touch()?;
+                    }
+                    let mut m = CljMap::new();
+                    m.assoc(kwv("vals"), Value::vector(vals));
+                    m.assoc(kwv("str"), Value::from(p(&e.to_value())));
+                    if touch {
+                        let entries = e.entries()?;
+                        m.assoc(
+                            kwv("seq"),
+                            Value::vector(entries.iter().map(|(k, v)| vector![k.clone(), v.clone()]).collect()),
+                        );
+                        m.assoc(kwv("count"), Value::from(entries.len()));
+                    } else {
+                        m.assoc(kwv("seq"), Value::Nil);
+                        m.assoc(kwv("count"), Value::Nil);
+                    }
+                    Value::map(m)
+                }
+            };
+            (p(&view), nothing)
+        }
+        "entity-path" => {
+            // from an entity along a path: an attribute, or one of the oracle's steps
+            let mut x = datascript::entity(&db_arg(&arg("db")?)?, &arg("eid")?)?.map_or(Value::Nil, |e| e.to_value());
+            for k in seq_arg(&arg("path")?)? {
+                let entity = Entity::from_value(&x);
+                let step = k.as_keyword().map(|k| k.full().to_string());
+                let op = k.as_seq().and_then(|s| s.first()).and_then(Value::as_keyword).map(|k| k.full().to_string());
+                let operand = |i: usize| k.as_seq().and_then(|s| s.get(i)).cloned().unwrap_or(Value::Nil);
+                let lookup = |x: &Value, k: &Value| -> Result<Option<Value>> {
+                    match Entity::from_value(x) {
+                        Some(e) => e.lookup_entry(k),
+                        None => Ok(clj::get(x, k)),
+                    }
+                };
+                x = match (step.as_deref(), op.as_deref()) {
+                    (Some("oracle/first"), _) => match &entity {
+                        Some(e) => e.entries()?.into_iter().next().map_or(Value::Nil, |(k, v)| vector![k, v]),
+                        None => clj::seq(&x)?.into_iter().next().unwrap_or(Value::Nil),
+                    },
+                    (Some("oracle/touch"), _) => {
+                        if let Some(e) = &entity {
+                            e.touch()?;
+                        } else if x.is_some() {
+                            return Err(Error::msg("Assert failed: (or (nil? e) (entity? e))"));
+                        }
+                        x
+                    }
+                    (Some("oracle/count"), _) => match &entity {
+                        Some(e) => Value::from(e.entries()?.len()),
+                        None => {
+                            call(&datascript::built_ins::query_fn(&datascript::Symbol::parse("count")).unwrap(), &[x])?
+                        }
+                    },
+                    (Some("oracle/seq"), _) => match &entity {
+                        Some(e) => Value::vector(e.entries()?.into_iter().map(|(k, v)| vector![k, v]).collect()),
+                        None => Value::vector(clj::seq(&x)?),
+                    },
+                    (Some("oracle/keys"), _) => match &entity {
+                        Some(e) => Value::vector(e.entries()?.into_iter().map(|(k, _)| k).collect()),
+                        None => match &x {
+                            Value::Map(m) => Value::vector(m.keys().cloned().collect()),
+                            _ => Value::vector(Vec::new()),
+                        },
+                    },
+                    (_, Some("contains")) => match &entity {
+                        Some(e) => Value::Bool(e.contains_key(&operand(1))?),
+                        None => Value::Bool(clj::contains(&x, &operand(1))?),
+                    },
+                    (_, Some("call")) => call(&x, &[operand(1)])?,
+                    (_, Some("get")) => lookup(&x, &operand(1))?.unwrap_or_else(|| operand(2)),
+                    _ => lookup(&x, &k)?.unwrap_or(Value::Nil),
+                };
+            }
+            (p(&x), nothing)
+        }
+        "entity-eq" => {
+            let e1 = datascript::entity(&db_arg(&arg("a")?)?, &arg("e1")?)?.map_or(Value::Nil, |e| e.to_value());
+            let e2 = datascript::entity(&db_arg(&arg("b")?)?, &arg("e2")?)?.map_or(Value::Nil, |e| e.to_value());
+            (p(&vector![e1 == e2, e1.cljs_hash() == e2.cljs_hash()]), nothing)
+        }
+        "parse-query" => (p(&datascript::parser::parse_query(&arg("query")?)?), nothing),
+        "parse-pull" => {
+            let parsed = datascript::pull_parser::parse_pattern(&db_arg(&arg("db")?)?, &arg("pattern")?)?;
+            (p(&datascript::pull_parser::pattern_to_value(&parsed)), nothing)
+        }
         "datoms" | "seek-datoms" | "rseek-datoms" => {
             let db = db_arg(&arg("db")?)?;
             let index = index_arg(&arg("index")?)?;
@@ -260,11 +429,13 @@ fn run_step(env: &Env, step: &Value) -> Result<(String, Value)> {
             (p(&datoms_vector(found)), nothing)
         }
         "entid" => {
-            let v = Value::from(db_arg(&arg("db")?)?.entid(&arg("eid")?)?);
+            let v = db_arg(&arg("db")?)?.entid_value(&arg("eid")?)?;
             (p(&v), v)
         }
         "schema" => (p(&db_arg(&arg("db")?)?.schema_value()), nothing),
         "rschema" => match arg("db")? {
+            // (:rschema db), which a filtered database does not answer
+            Value::Db(db) if db.is_filtered() => return Err(Error::msg("-lookup is not supported on FilteredDB")),
             Value::Db(db) => (p(&db.rschema_value()), nothing),
             // (:rschema nil), after a step that failed
             _ => ("nil".into(), nothing),

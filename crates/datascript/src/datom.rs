@@ -137,7 +137,7 @@ pub fn id_from_num(n: f64) -> Result<i32> {
     if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
         Ok(n as i32)
     } else {
-        Err(Error::msg(format!(
+        Err(Error::no_such_id(format!(
             "Entity and transaction ids are whole numbers below 2^31, got {}",
             crate::print::number_to_string(n)
         )))

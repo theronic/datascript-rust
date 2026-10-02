@@ -13,22 +13,38 @@ pub struct Error {
     pub data: Value,
     /// The host's own exception, when a function of the host's threw: it passes through unchanged
     pub host: Option<Arc<dyn Any + Send + Sync>>,
+    /// Whether it is of a number that no entity has for an id: a fraction. Reading by one finds nothing.
+    pub(crate) no_such_id: bool,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     pub fn new(message: impl Into<String>, data: Value) -> Error {
-        Error { message: message.into(), data, host: None }
+        Error { message: message.into(), data, host: None, no_such_id: false }
     }
 
     /// An error without data, as a plain `js/Error` is.
     pub fn msg(message: impl Into<String>) -> Error {
-        Error { message: message.into(), data: Value::Nil, host: None }
+        Error { message: message.into(), data: Value::Nil, host: None, no_such_id: false }
+    }
+
+    /// The error of an id no entity can have. ClojureScript takes any number for one, and finds nothing by it.
+    pub(crate) fn no_such_id(message: impl Into<String>) -> Error {
+        Error { message: message.into(), data: Value::Nil, host: None, no_such_id: true }
+    }
+
+    /// Nothing, when the error is of an id that no entity has; the error otherwise.
+    pub(crate) fn or_nothing<T>(self) -> Result<Option<T>> {
+        if self.no_such_id {
+            Ok(None)
+        } else {
+            Err(self)
+        }
     }
 
     pub fn host(message: impl Into<String>, exception: Arc<dyn Any + Send + Sync>) -> Error {
-        Error { message: message.into(), data: Value::Nil, host: Some(exception) }
+        Error { message: message.into(), data: Value::Nil, host: Some(exception), no_such_id: false }
     }
 
     /// `(:error (ex-data e))`, as `ns/name`

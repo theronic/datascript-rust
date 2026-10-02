@@ -506,6 +506,21 @@ impl<T: Clone> Slice<T> {
         RevIter::new(&self.set, self.from, self.to)
     }
 
+    /// The place of the run's first element, and the place after its last.
+    pub fn bounds(&self) -> (Pos, Pos) {
+        (self.from, self.to)
+    }
+
+    /// The run from a place in it on: where an iteration that stopped goes on.
+    pub fn iter_from(&self, from: Pos) -> Iter<'_, T> {
+        Iter::new(&self.set, from.max(self.from), self.to)
+    }
+
+    /// The run backwards from before a place in it.
+    pub fn iter_rev_from(&self, to: Pos) -> RevIter<'_, T> {
+        RevIter::new(&self.set, self.from, to.min(self.to))
+    }
+
     pub fn to_vec(&self) -> Vec<T> {
         self.iter().cloned().collect()
     }
@@ -548,6 +563,24 @@ impl<'a, T: Clone> Iter<'a, T> {
         } else {
             self.leaf.len()
         };
+    }
+}
+
+impl<T> Iter<'_, T> {
+    /// The place of the element `next` would give.
+    pub fn pos(&self) -> Pos {
+        self.pos
+    }
+}
+
+impl<T> RevIter<'_, T> {
+    /// The place after the element `next` would give.
+    pub fn pos(&self) -> Pos {
+        if self.done {
+            self.from
+        } else {
+            self.pos
+        }
     }
 }
 

@@ -129,6 +129,7 @@ fn write(out: &mut String, v: &Value, readably: bool) {
         }
         Value::Datom(d) => pr_datom(out, d),
         Value::Db(db) => pr_db(out, db),
+        Value::Fn(f) if f.is_constructor() => out.push_str(f.name()),
         Value::Fn(f) => {
             out.push_str("#object[");
             out.push_str(if f.name().is_empty() { "Function" } else { f.name() });

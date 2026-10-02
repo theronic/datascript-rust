@@ -142,7 +142,9 @@ pub fn contains(coll: &Value, k: &Value) -> Result<bool> {
         Value::Str(s) => {
             Ok(k.as_num().is_some_and(|i| i.fract() == 0.0 && i >= 0.0 && (i as usize) < s.encode_utf16().count()))
         }
-        _ => Err(Error::msg(format!("contains? not supported on type: {}", coll.type_name()))),
+        Value::Datom(d) => Ok(d.val_at(k).is_some()),
+        // ClojureScript's `contains?` is a `get` that found something: of what has no keys, false
+        _ => Ok(false),
     }
 }
 
@@ -273,7 +275,7 @@ pub fn sort_by<C: FnMut(&Value, &Value) -> Result<std::cmp::Ordering>>(items: &m
 
 /// The elements of a seqable value, or ClojureScript's complaint that it is not one.
 pub fn seq(v: &Value) -> Result<Vec<Value>> {
-    v.seq_items().ok_or_else(|| Error::msg(format!("{} is not ISeqable", pr_str(v))))
+    v.seq_items().ok_or_else(|| Error::msg(format!("{} is not ISeqable", crate::print::str_of(v))))
 }
 
 /// `(vec coll)`

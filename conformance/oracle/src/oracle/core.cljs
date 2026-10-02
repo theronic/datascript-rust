@@ -27,23 +27,25 @@
 (declare fns)
 
 (defn- resolve-args
-  "x with every #r replaced by the value the case bound to it, and every #f by its function."
+  "x with every #r replaced by the value the case bound to it, and every #f by its function. Only the
+  collections the case was read as are walked into: a value put in place of a #r is left alone."
   [env x]
-  (walk/prewalk
-    (fn [v]
-      (cond
-        (instance? Ref v)
-        (let [k (:name v)]
-          (when-not (contains? env k)
-            (throw (js/Error. (str "oracle: unbound ref " k))))
-          (get env k))
+  (cond
+    (instance? Ref x)
+    (let [k (:name x)]
+      (when-not (contains? env k)
+        (throw (js/Error. (str "oracle: unbound ref " k))))
+      (get env k))
 
-        (instance? FnRef v)
-        (or (get fns (:name v))
-          (throw (js/Error. (str "oracle: unknown fn " (:name v)))))
+    (instance? FnRef x)
+    (or (get fns (:name x))
+      (throw (js/Error. (str "oracle: unknown fn " (:name x)))))
 
-        :else v))
-    x))
+    (vector? x) (mapv #(resolve-args env %) x)
+    (seq? x)    (apply list (map #(resolve-args env %) x))
+    (map? x)    (into (empty x) (map (fn [[k v]] [(resolve-args env k) (resolve-args env v)])) x)
+    (set? x)    (into (empty x) (map #(resolve-args env %)) x)
+    :else       x))
 
 ;; ---------------------------------------------------------------- functions both sides know
 
@@ -61,6 +63,18 @@
    'always       (fn [& _] true)
    'never        (fn [& _] false)
    'throw        (fn [& _] (throw (ex-info "thrown by host fn" {:error :host/thrown})))
+   'minmax       (fn [xs] (vector (reduce min xs) (reduce max xs)))
+   'range        range
+   'five         (fn [] 5)
+   'when-even    (fn [x] (when (even? x) x))
+   'first        first
+   'second       second
+   'gt18         (fn [x] (> x 18))
+   'age-is       (fn [db e a] (= a (:age (d/entity db e))))
+   'sort-reverse (fn [xs] (reverse (sort xs)))
+   'false-fn     (fn [& _] false)
+   'kv           (fn [m] (vec (seq m)))
+   'throw-odd    (fn [x] (if (odd? x) (throw (ex-info "odd" {:error :host/odd})) x))
    ;; aggregates
    'agg-count    (fn [coll] (count coll))
    'agg-first    (fn [coll] (first coll))
@@ -84,6 +98,17 @@
    'f-has-name   (fn [db datom] (some? (:name (d/entity db (:e datom)))))
    'f-none       (fn [_ _] false)
    'f-all        (fn [_ _] true)
+   'f-not-password (fn [_ datom] (not= :password (:a datom)))
+   'f-not-e2     (fn [_ datom] (not= 2 (:e datom)))
+   'f-long-akas  (fn [udb datom] (or (not= :aka (:a datom))
+                                   (<= (count (:aka (d/entity udb (:e datom)))) 1)
+                                   (>= (count (:v datom)) 4)))
+   'f-has-age    (fn [db datom] (some? (:age (d/entity db (:e datom)))))
+   'f-adult      (fn [db datom] (>= (:age (d/entity db (:e datom))) 18))
+   'f-not-tupen  (fn [_ datom] (not= "Tupen" (:v datom)))
+   'f-throw      (fn [_ _] (throw (ex-info "thrown by filter" {:error :host/thrown})))
+   'get-name     (fn [x] (:name x))
+   'names        (fn [xs] (mapv :name xs))
    ;; pull xforms
    'x-vector     vector
    'x-str        str
@@ -171,9 +196,31 @@
       (let [r (apply d/q (arg :query) (arg :inputs))]
         [(p r) r])
 
+      :q-count
+      ;; a query over the database behind a filter that passes everything and counts what it is asked
+      (let [cnt (volatile! 0)
+            db  (d/filter (arg :db) (fn [_ _] (vswap! cnt inc) true))
+            r   (apply d/q (arg :query) db (arg :inputs))]
+        [(p [@cnt r]) r])
+
+      :pull-count
+      (let [cnt (volatile! 0)
+            db  (d/filter (arg :db) (fn [_ _] (vswap! cnt inc) true))
+            r   (d/pull db (arg :pattern) (arg :eid))]
+        [(p [@cnt r]) r])
+
       :pull
       (let [r (d/pull (arg :db) (arg :pattern) (arg :eid))]
         [(p r) r])
+
+      :pull-depth
+      ;; how deep a pull went along one attribute, and what it found there: too deep to print whole
+      (let [r   (d/pull (arg :db) (arg :pattern) (arg :eid))
+            key (arg :key)]
+        (loop [depth 0 node r]
+          (if-some [next (get-in node [key 0])]
+            (recur (inc depth) next)
+            [(p [depth node]) nil])))
 
       :pull-many
       (let [r (d/pull-many (arg :db) (arg :pattern) (arg :eids))]
@@ -206,6 +253,29 @@
       :entity
       (let [e (d/entity (arg :db) (arg :eid))]
         [(p (entity-view e (arg :attrs) (:touch step))) nil])
+
+      :entity-path
+      ;; from an entity along a path: an attribute, or one of the steps below
+      (let [e (d/entity (arg :db) (arg :eid))
+            r (reduce
+                (fn [x k]
+                  (cond
+                    (= k :oracle/first) (first x)
+                    (= k :oracle/touch) (d/touch x)
+                    (= k :oracle/count) (count x)
+                    (= k :oracle/seq)   (vec (seq x))
+                    (= k :oracle/keys)  (vec (keys x))
+                    (and (vector? k) (= :contains (first k))) (contains? x (second k))
+                    (and (vector? k) (= :call (first k)))     (x (second k))
+                    (and (vector? k) (= :get (first k)))      (get x (second k) (nth k 2))
+                    :else (get x k)))
+                e (arg :path))]
+        [(p r) nil])
+
+      :entity-eq
+      (let [e1 (d/entity (arg :a) (arg :e1))
+            e2 (d/entity (arg :b) (arg :e2))]
+        [(p [(= e1 e2) (= (hash e1) (hash e2))]) nil])
 
       :schema
       [(p (d/schema (arg :db))) nil]

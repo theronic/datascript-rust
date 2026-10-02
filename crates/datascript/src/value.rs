@@ -81,16 +81,18 @@ impl std::ops::Deref for Seq {
     }
 }
 
-/// A regular expression, as `re-pattern` makes one. The host matches it (`crate::regex`).
+/// A regular expression, as `re-pattern` makes one. `crate::regex` matches it.
 pub struct Regex {
     pub source: Str,
     pub flags: Str,
     id: u32,
+    /// What it compiles to, once it has been matched against
+    pub(crate) program: OnceLock<crate::regex::Compiled>,
 }
 
 impl Regex {
     pub fn new(source: &str, flags: &str) -> Regex {
-        Regex { source: Arc::from(source), flags: Arc::from(flags), id: next_uid() }
+        Regex { source: Arc::from(source), flags: Arc::from(flags), id: next_uid(), program: OnceLock::new() }
     }
 }
 
@@ -114,6 +116,8 @@ struct FuncInner {
     f: Box<NativeFn>,
     /// The host's own handle for it, when it is the host's
     host: Option<Arc<dyn Any + Send + Sync>>,
+    /// Whether it is a ClojureScript type, which prints as its name
+    constructor: bool,
 }
 
 impl Func {
@@ -121,7 +125,31 @@ impl Func {
     where
         F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
     {
-        Func(Arc::new(FuncInner { id: next_uid(), name: Box::from(name), f: Box::new(f), host: None }))
+        Func(Arc::new(FuncInner {
+            id: next_uid(),
+            name: Box::from(name),
+            f: Box::new(f),
+            host: None,
+            constructor: false,
+        }))
+    }
+
+    /// A ClojureScript type, as `(type x)` answers: it prints as its name, `cljs.core/Keyword`.
+    pub fn constructor<F>(name: &str, f: F) -> Func
+    where
+        F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
+    {
+        Func(Arc::new(FuncInner {
+            id: next_uid(),
+            name: Box::from(name),
+            f: Box::new(f),
+            host: None,
+            constructor: true,
+        }))
+    }
+
+    pub fn is_constructor(&self) -> bool {
+        self.0.constructor
     }
 
     /// A function of the host's: `handle` is what the host knows it by, and is handed back when the function is a
@@ -130,7 +158,13 @@ impl Func {
     where
         F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
     {
-        Func(Arc::new(FuncInner { id: next_uid(), name: Box::from(name), f: Box::new(f), host: Some(handle) }))
+        Func(Arc::new(FuncInner {
+            id: next_uid(),
+            name: Box::from(name),
+            f: Box::new(f),
+            host: Some(handle),
+            constructor: false,
+        }))
     }
 
     #[inline]
@@ -170,6 +204,10 @@ pub trait HostObject: Send + Sync + 'static {
         None
     }
     fn as_any(&self) -> &dyn Any;
+    /// Itself as a shared `Any`, for a type that is handed back out as what it is.
+    fn as_arc_any(self: Arc<Self>) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
 }
 
 #[derive(Clone)]

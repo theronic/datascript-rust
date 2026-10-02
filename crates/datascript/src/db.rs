@@ -90,15 +90,25 @@ pub struct Datoms {
     v: Option<Value>,
     tx: Option<i32>,
     pred: Option<Pred>,
+    /// What finding them failed with: it is theirs to raise when they are read
+    failed: Option<Error>,
 }
 
 impl Datoms {
     fn new(slice: Slice<Datom>, pred: Option<&Pred>) -> Datoms {
-        Datoms { slice, rev: false, v: None, tx: None, pred: pred.cloned() }
+        Datoms { slice, rev: false, v: None, tx: None, pred: pred.cloned(), failed: None }
     }
 
     pub fn empty() -> Datoms {
-        Datoms { slice: Slice::empty(), rev: false, v: None, tx: None, pred: None }
+        Datoms { slice: Slice::empty(), rev: false, v: None, tx: None, pred: None, failed: None }
+    }
+
+    #[inline]
+    fn check(&self) -> Result<()> {
+        match &self.failed {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
     }
 
     fn keep(&self, d: &Datom) -> Result<bool> {
@@ -125,6 +135,7 @@ impl Datoms {
 
     /// Each datom in turn, until `f` answers false.
     pub fn try_for_each(&self, mut f: impl FnMut(&Datom) -> Result<bool>) -> Result<()> {
+        self.check()?;
         let plain = self.unfiltered();
         let mut step = |d: &Datom| -> Result<bool> {
             if plain || self.keep(d)? {
@@ -150,6 +161,7 @@ impl Datoms {
     }
 
     pub fn first(&self) -> Result<Option<Datom>> {
+        self.check()?;
         if self.unfiltered() && !self.rev {
             return Ok(self.slice.first().cloned());
         }
@@ -162,6 +174,7 @@ impl Datoms {
     }
 
     pub fn is_empty(&self) -> Result<bool> {
+        self.check()?;
         if self.unfiltered() {
             return Ok(self.slice.is_empty());
         }
@@ -169,6 +182,7 @@ impl Datoms {
     }
 
     pub fn to_vec(&self) -> Result<Vec<Datom>> {
+        self.check()?;
         if self.unfiltered() && !self.rev {
             return Ok(self.slice.to_vec());
         }
@@ -215,6 +229,7 @@ impl Datoms {
     }
 
     pub fn count(&self) -> Result<usize> {
+        self.check()?;
         if self.unfiltered() {
             return Ok(self.slice.count());
         }
@@ -230,6 +245,75 @@ impl Datoms {
     pub fn reversed(mut self) -> Datoms {
         self.rev = !self.rev;
         self
+    }
+
+    /// Where reading starts: a place to read a part at a time from, as a lazy sequence is read.
+    pub fn cursor(&self) -> Cursor {
+        let (from, to) = self.slice.bounds();
+        Cursor { pos: if self.rev { to } else { from }, done: self.slice.is_empty() }
+    }
+
+    /// The next datoms from a cursor, at most `n`, which moves the cursor past them. An empty answer is the end.
+    pub fn next_chunk(&self, cursor: &mut Cursor, n: usize) -> Result<Vec<Datom>> {
+        self.check()?;
+        let mut out = Vec::new();
+        if cursor.done || n == 0 {
+            return Ok(out);
+        }
+        let plain = self.unfiltered();
+        if self.rev {
+            let mut it = self.slice.iter_rev_from(cursor.pos);
+            loop {
+                match it.next() {
+                    None => {
+                        cursor.done = true;
+                        break;
+                    }
+                    Some(d) => {
+                        if plain || self.keep(d)? {
+                            out.push(d.clone());
+                            if out.len() == n {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            cursor.pos = it.pos();
+        } else {
+            let mut it = self.slice.iter_from(cursor.pos);
+            loop {
+                match it.next() {
+                    None => {
+                        cursor.done = true;
+                        break;
+                    }
+                    Some(d) => {
+                        if plain || self.keep(d)? {
+                            out.push(d.clone());
+                            if out.len() == n {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            cursor.pos = it.pos();
+        }
+        Ok(out)
+    }
+}
+
+/// A place in a run of datoms that is read a part at a time.
+#[derive(Clone, Copy)]
+pub struct Cursor {
+    pos: crate::sorted_set::Pos,
+    done: bool,
+}
+
+impl Cursor {
+    pub fn is_done(&self) -> bool {
+        self.done
     }
 }
 
@@ -329,7 +413,12 @@ pub(crate) fn resolve_tuple_refs<D: Searchable>(
     let mut out = Vec::with_capacity(items.len());
     for (idx, v) in items.iter().enumerate() {
         if tuple_ref_slot(db, p, idx) && !resolved_eid(v) {
-            out.push(Value::from(entid_strict(db, v)?));
+            // a fraction refers to nothing, and stays what it is
+            out.push(match entid_strict(db, v) {
+                Ok(e) => Value::from(e),
+                Err(err) if err.no_such_id => v.clone(),
+                Err(err) => return Err(err),
+            });
         } else {
             out.push(v.clone());
         }
@@ -413,6 +502,37 @@ fn slice(core: &DbCore, index: Index, from: &Bound, to: &Bound) -> Slice<Datom> 
     set.slice(lo, hi)
 }
 
+/// ClojureScript does not compare a keyword with a string, and a database's attributes are all of the one kind or
+/// all of the other. An attribute of the other kind is an error wherever a search would compare it with one of the
+/// database's: among the datoms of its entity in EAVT, anywhere in an index that attributes lead.
+fn kind_error(core: &DbCore, index: Index, e: i32, a: &Attr) -> Option<Error> {
+    let first = core.eavt.all().first()?.a.clone();
+    if first.is_keyword() == a.is_keyword() {
+        return None;
+    }
+    let compared = match index {
+        Index::Eavt => {
+            !slice(core, Index::Eavt, &Bound::new(e, None, Value::Nil, TX0), &Bound::new(e, None, Value::Nil, TXMAX))
+                .is_empty()
+        }
+        Index::Aevt => true,
+        Index::Avet => !core.avet.is_empty(),
+    };
+    compared.then(|| cannot_compare(&first, a))
+}
+
+fn cannot_compare(a: &Attr, b: &Attr) -> Error {
+    let s = |a: &Attr| crate::print::str_of(&attr_value(a));
+    Error::msg(format!("Cannot compare {} to {}", s(a), s(b)))
+}
+
+fn bound_kind_error(core: &DbCore, index: Index, bound: &Bound) -> Result<()> {
+    match bound.a.as_ref().and_then(|a| kind_error(core, index, bound.e, a)) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// `-search`: the datoms matching a pattern, each component of which may be left open. The index that serves the
 /// pattern best is walked, and what it cannot narrow is filtered.
 pub fn search<D: Searchable>(db: &D, e: Option<i32>, a: Option<&Attr>, v: Option<&Value>, tx: Option<i32>) -> Datoms {
@@ -474,6 +594,14 @@ pub fn search<D: Searchable>(db: &D, e: Option<i32>, a: Option<&Attr>, v: Option
             out.tx = tx;
         }
     }
+    if let Some(a) = a {
+        let index = match e {
+            Some(_) => Index::Eavt,
+            None if v.is_some() && core.schema.props(a).index => Index::Avet,
+            None => Index::Aevt,
+        };
+        out.failed = kind_error(core, index, e.unwrap_or(E0), a);
+    }
     out
 }
 
@@ -508,20 +636,35 @@ fn resolve_datom<D: Searchable>(
     let context =
         || Value::list(vec![Value::sym("resolve-datom"), Value::sym("db"), e.clone(), a.clone(), v.clone(), t.clone()]);
     let attr = if a.is_some() { Some(validate_attr(a, context)?) } else { None };
-    let e = if e.is_some() { entid_strict(db, e)? } else { default_e };
+    // An id that is a fraction is no entity's, and lies between two that may be: a bound from below is the next
+    // above it, a bound from above the next below.
+    let id = |x: &Value, lower: bool| -> Result<i32> {
+        match entid_strict(db, x) {
+            Err(err) if err.no_such_id => {
+                let n = x.as_num().unwrap_or(0.0);
+                Ok(if lower { n.ceil() as i32 } else { n.floor() as i32 })
+            }
+            other => other,
+        }
+    };
+    let e = if e.is_some() { id(e, default_e == E0)? } else { default_e };
     let v = if v.is_nil() {
         Value::Nil
     } else {
         let p = props_of(db, a);
         if p.is_ref {
-            Value::from(entid_strict(db, v)?)
+            match entid_strict(db, v) {
+                Ok(e) => Value::from(e),
+                Err(err) if err.no_such_id => v.clone(),
+                Err(err) => return Err(err),
+            }
         } else if p.tuple {
             resolve_tuple_refs(db, a, v, context)?
         } else {
             v.clone()
         }
     };
-    let tx = if t.is_some() { entid_strict(db, t)? } else { default_tx };
+    let tx = if t.is_some() { id(t, default_tx == TX0)? } else { default_tx };
     Ok(Bound::new(e, attr, v, tx))
 }
 
@@ -548,6 +691,8 @@ pub fn datoms<D: Searchable>(db: &D, index: Index, c0: &Value, c1: &Value, c2: &
     validate_indexed(db, index, c0, c1, c2, c3)?;
     let from = components_bound(db, index, c0, c1, c2, c3, E0, TX0)?;
     let to = components_bound(db, index, c0, c1, c2, c3, EMAX, TXMAX)?;
+    bound_kind_error(db.core(), index, &from)?;
+    bound_kind_error(db.core(), index, &to)?;
     Ok(Datoms::new(slice(db.core(), index, &from, &to), db.pred()))
 }
 
@@ -567,6 +712,7 @@ pub fn seek_datoms<D: Searchable>(
 ) -> Result<Datoms> {
     validate_indexed(db, index, c0, c1, c2, c3)?;
     let from = components_bound(db, index, c0, c1, c2, c3, E0, TX0)?;
+    bound_kind_error(db.core(), index, &from)?;
     seek_bounds(db, index, &from)
 }
 
@@ -581,6 +727,7 @@ pub fn rseek_datoms<D: Searchable>(
 ) -> Result<Datoms> {
     validate_indexed(db, index, c0, c1, c2, c3)?;
     let to = components_bound(db, index, c0, c1, c2, c3, EMAX, TXMAX)?;
+    bound_kind_error(db.core(), index, &to)?;
     let from = Bound::new(E0, None, Value::Nil, TX0);
     Ok(Datoms::new(slice(db.core(), index, &from, &to), db.pred()).reversed())
 }
@@ -605,6 +752,7 @@ pub fn find_datom(db: &Db, index: Index, c0: &Value, c1: &Value, c2: &Value, c3:
     validate_indexed(db, index, c0, c1, c2, c3)?;
     let from = components_bound(db, index, c0, c1, c2, c3, E0, TX0)?;
     let to = components_bound(db, index, c0, c1, c2, c3, EMAX, TXMAX)?;
+    bound_kind_error(db.core(), index, &from)?;
     let set = index_of(db.core(), index);
     let found = set.at(set.lower_bound(|d| index.cmp_bound(d, &from)));
     Ok(found.filter(|d| index.cmp_bound(d, &to) != Ordering::Greater).cloned())
@@ -625,6 +773,13 @@ impl DbCore {
         }
     }
 
+    /// The datoms of an index between two bounds, both included.
+    pub(crate) fn slice_between(&self, index: Index, from: &Bound, to: &Bound) -> Result<Vec<Datom>> {
+        bound_kind_error(self, index, from)?;
+        bound_kind_error(self, index, to)?;
+        Ok(slice(self, index, from, to).to_vec())
+    }
+
     /// `advance-max-eid`: an entity id above the highest so far, and below the transactions', is the highest now.
     #[inline]
     pub(crate) fn advance_max_eid(&mut self, eid: i32) {
@@ -637,6 +792,12 @@ impl DbCore {
     pub(crate) fn apply(&mut self, datom: &Datom) -> Result<()> {
         let indexing = self.schema.props(&datom.a).index;
         if datom.added() {
+            // keywords and strings do not compare: a database's attributes are all of one kind
+            if let Some(first) = self.eavt.all().first() {
+                if first.a.is_keyword() != datom.a.is_keyword() {
+                    return Err(cannot_compare(&first.a, &datom.a));
+                }
+            }
             self.eavt.insert(datom.clone(), &|a, b| Index::Eavt.cmp(a, b));
             self.aevt.insert(datom.clone(), &|a, b| Index::Aevt.cmp(a, b));
             if indexing {
@@ -698,6 +859,11 @@ impl Db {
     /// `(init-db datoms schema)`: a database of these datoms, taken as they are.
     pub fn init(datoms: Vec<Datom>, schema: Value) -> Result<Db> {
         let schema = Arc::new(Schema::new(schema)?);
+        if let Some(first) = datoms.first() {
+            if let Some(other) = datoms.iter().find(|d| d.a.is_keyword() != first.a.is_keyword()) {
+                return Err(cannot_compare(&first.a, &other.a));
+            }
+        }
         let mut by_eavt = datoms;
         by_eavt.sort_by(|a, b| Index::Eavt.cmp(a, b));
         let mut by_aevt = by_eavt.clone();
@@ -903,6 +1069,15 @@ impl Db {
     /// `(d/entid db eid)`
     pub fn entid(&self, eid: &Value) -> Result<Option<i32>> {
         entid(self, eid)
+    }
+
+    /// `(d/entid db eid)` as ClojureScript answers it: a number is itself, whatever number it is.
+    pub fn entid_value(&self, eid: &Value) -> Result<Value> {
+        match entid(self, eid) {
+            Ok(e) => Ok(Value::from(e)),
+            Err(err) if err.no_such_id => Ok(eid.clone()),
+            Err(err) => Err(err),
+        }
     }
 }
 
