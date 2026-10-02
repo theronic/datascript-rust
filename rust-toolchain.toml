@@ -1,0 +1,5 @@
+# The Rust the port is built with, and its WebAssembly target.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

@@ -30,3 +30,9 @@ web/target-cljs
 .shadow-cljs
 .clj-kondo
 .lsp
+# The Rust port: cargo's build folder, and the conformance oracle's compiled ClojureScript
+/target/
+/conformance/oracle/target/
+/conformance/out/
+/cljs/target/
+/js/dist/

@@ -1,0 +1,12 @@
+[package]
+name = "datascript"
+description = "DataScript, the immutable in-memory database and Datalog query engine, ported from ClojureScript"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
