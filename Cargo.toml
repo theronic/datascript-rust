@@ -1,0 +1,25 @@
+# DataScript in Rust, for WebAssembly: a port of the ClojureScript in src/, which stays in this repository as its
+# reference. crates/datascript is the database, crates/datascript-wasm its WebAssembly module, and crates/conformance
+# runs the port against ClojureScript DataScript itself (conformance/oracle).
+[workspace]
+resolver = "2"
+members = ["crates/datascript", "crates/datascript-wasm", "crates/conformance"]
+
+[workspace.package]
+# DataScript's version, the one ported
+version = "1.8.1"
+edition = "2021"
+license = "EPL-1.0"
+repository = "https://github.com/theronic/datascript-rust"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# The WebAssembly module as a page loads it: built for size
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+strip = true

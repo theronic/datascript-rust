@@ -139,3 +139,23 @@ lein with-profile test cljsbuild once release
 - `:datomic` - Datomic compatibility testing
 - `:cljs` - ClojureScript compilation
 - `:1.9`, `:1.10`, `:1.11.1`, `:1.12` - Override Clojure versions
+
+## The Rust port
+
+This fork ports DataScript to Rust for WebAssembly (docs/rust.md). `src/` is the port's reference and is not changed
+by it.
+
+- `crates/datascript` - the database, a Rust library; `crates/datascript-wasm` - the WebAssembly module;
+  `cljs/` - `datascript.core` over the module; `crates/conformance`, `conformance/` - the harness.
+- The port answers what ClojureScript DataScript answers, in its order, with its errors. A change to the port is
+  checked against the oracle, never against what seems right.
+
+```bash
+cargo test --workspace            # the crates' tests
+./conformance/run.sh              # the Rust library against ClojureScript DataScript
+./conformance/run-wasm.sh         # the module behind its ClojureScript interface, likewise
+./cljs/test.sh                    # DataScript's own tests on the module (./cljs/test.sh advanced too)
+./cljs/js-api.sh                  # DataScript's JavaScript API and its tests on the module
+./cljs/bench.sh                   # ClojureScript DataScript and the module, timed side by side
+./script/test_rust.sh             # all of the checks above
+```

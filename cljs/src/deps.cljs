@@ -1,0 +1,1 @@
+{:externs ["datascript/externs.js"]}

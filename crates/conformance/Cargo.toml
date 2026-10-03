@@ -1,0 +1,14 @@
+[package]
+name = "conformance"
+description = "Runs the Rust port over the conformance cases, to compare with ClojureScript DataScript's own answers (conformance/oracle)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"
+
+[dependencies]
+datascript = { path = "../datascript" }

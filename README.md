@@ -1,5 +1,27 @@
 <img src="./extras/logo.svg">
 
+## DataScript in Rust, for WebAssembly
+
+This fork ports DataScript to Rust and compiles it to WebAssembly. It answers what ClojureScript DataScript answers,
+in the same order, and is checked against it answer by answer.
+
+- **From ClojureScript**, `cljs/src` is `datascript.core` over the module: a program written for DataScript compiles
+  against it unchanged, and loads the module first.
+- **From JavaScript**, DataScript's JavaScript API over the module, or the module's EDN interface with no
+  ClojureScript at all.
+- **From any other WebAssembly host**, the module itself: a handful of exports, and EDN text in and out.
+- **From Rust**, the `datascript` crate.
+
+```bash
+cargo build -p datascript-wasm --target wasm32-unknown-unknown --profile wasm-release   # the module
+./script/test_rust.sh                                                                    # everything that checks it
+```
+
+[docs/rust.md](docs/rust.md) says how to use it, how it is checked, how fast it is, and where it knowingly differs.
+DataScript's own README follows.
+
+---
+
 > What if creating a database would be as cheap as creating a Hashmap?
 
 An immutable in-memory database and Datalog query engine in Clojure and ClojureScript.

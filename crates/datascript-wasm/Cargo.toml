@@ -1,0 +1,15 @@
+[package]
+name = "datascript-wasm"
+description = "DataScript's WebAssembly module: the database behind a small binary interface, for ClojureScript, JavaScript and other WebAssembly programs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+datascript = { path = "../datascript" }
