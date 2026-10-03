@@ -10,4 +10,12 @@
   (or (gobj/getValueByKeys js/process "env" "DATASCRIPT_WASM")
     "target/wasm32-unknown-unknown/wasm-release/datascript_wasm.wasm"))
 
-(wasm/instantiate-sync (js-invoke (js/require "fs") "readFileSync" path))
+(def instance
+  (wasm/instantiate-sync (js-invoke (js/require "fs") "readFileSync" path)))
+
+(def embedded?
+  "Whether the module is one built into another program (crates/datascript-wasm/examples/embedded.rs),
+  which is then started, as its host starts it."
+  (if-some [start (gobj/getValueByKeys instance "exports" "embedded_start")]
+    (do (start) true)
+    false))

@@ -177,6 +177,49 @@ Values are ClojureScript's (`Value`): numbers are doubles, and maps and sets ite
 `datascript::Conn` is a connection, `datascript::entity` an entity, `Db::filter` a filtered database, and
 `datascript::serialize` DataScript's serializable form.
 
+### A Rust program in one module with it
+
+A Rust program for WebAssembly that has `datascript` and `datascript-wasm` among its crates is one module with
+them: its exports are the module's and its own, and its memory is the module's. To its host it is DataScript, whole,
+for `datascript.core` or any other interface over the module; and it reads and transacts the databases that host
+holds by calling `datascript` as above, with nothing encoded and no boundary crossed.
+
+```rust
+use datascript::{Index, Result, Value};
+use datascript_wasm::codec::Writer;
+
+fn answer(op: u32, args: &[Value], w: &mut Writer) -> Result<()> {
+    // [db attr] → how many datoms the database the host named has of the attribute
+    let [Value::Db(db), attr] = args else { return Err(datascript::Error::msg("a database, and an attribute")) };
+    w.value(&Value::from(db.datoms(Index::Aevt, std::slice::from_ref(attr))?.count()?));
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "C" fn start() {
+    datascript_wasm::start();          // the module first
+    datascript_wasm::extend(answer);   // then what answers the program's operations, from ops::EXTENSION up
+}
+```
+
+```clojure
+(wasm/call 1000 #js [@conn :name])   ; the host calls them as the interface calls the module's own
+```
+
+- **Databases** cross as what they are. One the host names in a message is that database in the program's hands
+  (`Value::Db`), and one the program answers with is a database value to the host, held and let go of as any other.
+- **Functions of the host's** in a message are functions the program calls (`built_ins::call`), with their
+  arguments and answers in the module's form.
+- **A connection the host holds** is transacted on from the program with two such functions: one that answers the
+  database the connection holds, and one the program calls with the report of the transaction it made of that
+  database (`datascript::advance`), for the host to move its connection on and tell its listeners. In ClojureScript
+  the second is `datascript.conn/-moved-on!`.
+- **Linking.** The program's build script asks for the module's stack and for `__stack_pointer` to be exported, as
+  `crates/datascript-wasm/build.rs` does: what a build script asks for is asked of its own crate alone.
+
+`crates/datascript-wasm/examples/embedded.rs` is such a program, with that operation and one that transacts on a
+connection of its host's; `./cljs/test.sh simple embedded` runs DataScript's tests on it, and its own operations.
+
 ## How it is checked
 
 ```bash
@@ -185,6 +228,7 @@ cargo test --workspace             # the crates' own tests
 ./conformance/run.sh               # the Rust library against ClojureScript DataScript
 ./conformance/run-wasm.sh          # the module, behind its ClojureScript interface, against ClojureScript DataScript
 ./cljs/test.sh                     # DataScript's own tests on the module; ./cljs/test.sh advanced under :advanced
+./cljs/test.sh simple embedded     # the same on the module built into another program, and that program's operations
 ./cljs/js-api.sh                   # DataScript's JavaScript API over the module, and its own tests of it
 node crates/datascript-wasm/js/test-edn.mjs   # the module through its EDN interface
 ```
@@ -202,7 +246,10 @@ ClojureScript interface, which checks what crosses the boundary.
 the module in Node, with `:simple` and `:advanced` optimizations, beside tests of what is particular to the boundary
 (`cljs/test/datascript/test/wasm.cljs`): values that keep their identity, exceptions, long runs of datoms, values
 nested 20,000 deep, the stack running out and the module carrying on, a database as JSON text, and databases being
-let go of when the garbage collector says so.
+let go of when the garbage collector says so. The same tests run on the module built into another program
+(`crates/datascript-wasm/examples/embedded.rs`), with that program's operations: a database read where it is, and a
+connection held in ClojureScript transacted on from Rust, its listeners told what `transact!` would have told them
+(`cljs/test/datascript/test/embedded.cljs`).
 
 **The allocator.** `crates/datascript-wasm/js/leaf-check.mjs` reads the built module, and passes when the two
 functions that take memory and give it back call nothing and everything else that allocates calls only them: what

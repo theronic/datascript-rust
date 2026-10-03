@@ -13,3 +13,8 @@ path = "src/lib.rs"
 
 [dependencies]
 datascript = { path = "../datascript" }
+
+# The module built into another program, which adds operations of its own to it
+[[example]]
+name = "embedded"
+crate-type = ["cdylib"]

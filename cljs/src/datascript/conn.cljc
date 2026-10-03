@@ -118,6 +118,21 @@
          (callback report))
        report))))
 
+(defn ^:no-doc -moved-on!
+  "The connection moved on by a transaction that transact! did not make: one a program in the module
+  made, of the database the connection held (datascript-wasm, built into another program). The
+  connection now holds the report's :db-after, and its listeners are told of the report, as
+  transact! tells them. Throws when the connection holds another database than the report's
+  :db-before, and is left as it was."
+  [conn report]
+  {:pre [(conn? conn)]}
+  (when-not (compare-and-set! conn (:db-before report) (:db-after report))
+    (throw (ex-info "The connection holds another database than the one the transaction was made of"
+             {:error :transact/moved-on})))
+  (doseq [[_ callback] (:listeners @(:atom conn))]
+    (callback report))
+  report)
+
 (defn reset-conn!
   ([conn db]
    (reset-conn! conn db nil))
