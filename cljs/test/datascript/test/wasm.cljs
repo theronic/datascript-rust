@@ -2,6 +2,7 @@
   "What is particular to DataScript over the WebAssembly module: what crosses the boundary, and how."
   (:require
     [clojure.test :as t :refer [is are deftest testing async]]
+    [datascript.conn :as conn]
     [datascript.core :as d]
     [datascript.db :as db]
     [datascript.serialize :as serialize]
@@ -254,6 +255,31 @@
       (is (= "n35" (:name (d/entity (:db-before (nth @reports 37)) 1))))
       (is (= #{[1]} (d/q '[:find ?e :where [?e :name "n35"]] (:db-before (nth @reports 37)))))
       (is (= (last values) @conn)))))
+
+(deftest test-a-connection-moved-on-by-a-report
+  (testing "a connection moves on by a transaction transact! did not make, and its listeners are told of it"
+    (let [conn    (d/create-conn {:name {:db/unique :db.unique/identity}})
+          reports (atom [])
+          _       (d/listen! conn :test #(swap! reports conj %))
+          _       (d/transact! conn [{:name "Ivan" :age 15}])
+          before  @conn
+          report  (d/with before [{:db/id "p" :name "Petr"} [:db/add [:name "Ivan"] :friend "p"]])]
+      (is (identical? report (conn/-moved-on! conn report)))
+      (is (identical? (:db-after report) @conn))
+      (is (= [report] (rest @reports)))
+      (is (= "Petr" (:name (d/entity @conn [:name "Petr"]))))
+      (testing "and on from there, as it does from any database it holds"
+        (d/transact! conn [[:db/add [:name "Petr"] :age 37]])
+        (is (= 37 (:age (d/entity @conn [:name "Petr"]))))
+        (is (= 3 (count @reports))))
+      (testing "but not by a transaction made of a database it no longer holds"
+        (let [held @conn]
+          (is (thrown-with-msg? ExceptionInfo #"holds another database"
+                (conn/-moved-on! conn report)))
+          (is (= :transact/moved-on
+                (:error (ex-data (try (conn/-moved-on! conn report) (catch ExceptionInfo e e))))))
+          (is (identical? held @conn))
+          (is (= 3 (count @reports))))))))
 
 (deftest test-a-run-read-while-its-connection-moves-on
   (let [schema {:tag {:db/index true}}

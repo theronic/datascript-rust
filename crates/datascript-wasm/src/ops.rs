@@ -8,7 +8,7 @@ use datascript::datom::{id_from_num, value_attr};
 use datascript::db::{self, Datoms};
 use datascript::serialize::{self, Json};
 use datascript::{vector, Datom, Db, Error, Index, Result, Value};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// `[schema]` → db
 pub const EMPTY_DB: u32 = 1;
@@ -90,6 +90,22 @@ pub const COMPARE: u32 = 37;
 pub const EQUIV: u32 = 38;
 /// `[value]` → as ClojureScript's `str` makes a string of it
 pub const STR: u32 = 39;
+
+/// From this number up, an operation is one of the program's that the module is built into (`extend`), and none
+/// of the module's own.
+pub const EXTENSION: u32 = 1000;
+
+/// What answers the operations of a program the module is built into: as the module answers its own, from the
+/// operation's number and its arguments, by writing the answer, or with the error the host is to be thrown.
+pub type Extension = fn(op: u32, args: &[Value], w: &mut Writer) -> Result<()>;
+
+static EXTENDED: OnceLock<Extension> = OnceLock::new();
+
+/// The program the module is built into answers the operations from `EXTENSION` up. It says so once, as it starts;
+/// false, when it had been said already.
+pub fn extend(answer: Extension) -> bool {
+    EXTENDED.set(answer).is_ok()
+}
 
 static NIL: Value = Value::Nil;
 
@@ -217,6 +233,12 @@ fn found(op: u32, args: &[Value]) -> Option<Result<(Datoms, usize)>> {
 
 /// One operation, its answer written: a run of datoms as it is read, anything else as its value.
 pub fn answer(op: u32, args: &[Value], w: &mut Writer) -> Result<()> {
+    if op >= EXTENSION {
+        return match EXTENDED.get() {
+            Some(answer) => answer(op, args, w),
+            None => Err(Error::msg(format!("datascript: no operation {op}"))),
+        };
+    }
     if op == SERIALIZABLE {
         // the database as text, written into the answer as it is: no value is made of what may be most of memory
         let (freeze_fn, freeze_kw) = (freezer(arg(args, 1)), freezer(arg(args, 2)));
@@ -407,4 +429,41 @@ pub fn dispatch(op: u32, args: &[Value]) -> Result<Value> {
         STR => Value::from(datascript::print::str_of(arg(args, 0))),
         other => return Err(Error::msg(format!("datascript: no operation {other}"))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::Reader;
+
+    fn answered(op: u32, args: &[Value]) -> Result<Value> {
+        let mut w = Writer::new();
+        answer(op, args, &mut w)?;
+        Reader::new(&w.into_bytes()).value()
+    }
+
+    #[test]
+    fn a_program_answers_the_operations_it_adds() {
+        // no program has said what answers them
+        assert_eq!(answered(EXTENSION, &[]).unwrap_err().message, "datascript: no operation 1000");
+
+        fn twice(op: u32, args: &[Value], w: &mut Writer) -> Result<()> {
+            match (op - EXTENSION, arg(args, 0).as_num()) {
+                (0, Some(n)) => w.value(&Value::from(2.0 * n)),
+                (0, None) => return Err(Error::msg("twice: a number")),
+                _ => return Err(Error::msg(format!("twice: no operation {op}"))),
+            }
+            Ok(())
+        }
+        assert!(extend(twice));
+        // and it is said once
+        assert!(!extend(twice));
+
+        assert_eq!(answered(EXTENSION, &[Value::from(21)]).unwrap(), Value::from(42));
+        assert_eq!(answered(EXTENSION, &[Value::Nil]).unwrap_err().message, "twice: a number");
+        assert_eq!(answered(EXTENSION + 7, &[]).unwrap_err().message, "twice: no operation 1007");
+        // the module's own are its own still
+        assert_eq!(answered(STR, &[Value::kw("a/b")]).unwrap(), Value::from(":a/b"));
+        assert_eq!(answered(EXTENSION - 1, &[]).unwrap_err().message, "datascript: no operation 999");
+    }
 }

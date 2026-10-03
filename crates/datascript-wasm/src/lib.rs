@@ -45,6 +45,17 @@
 //! the host give its handle back.
 //!
 //! `ds_edn(ptr, len)` is the same database for a host that would rather write EDN than encode values (`edn_api`).
+//!
+//! # Built into another program
+//!
+//! A Rust program that has this crate and `datascript` among its own is one module with them: its exports are the
+//! module's and its own, and its memory is the module's, with the module's allocator. It reads and transacts the
+//! databases the host holds by calling `datascript` as any Rust program does, with no boundary between: a database
+//! the host names in a message is that database (`Value::Db`), and one the program answers with is a handle to the
+//! host. Operations of its own, numbered from `ops::EXTENSION` up, are called by the host as the module's are, once
+//! the program has said what answers them (`extend`); it calls `start` first, from an export the host calls when
+//! it has made the instance. Such a program is linked with the module's stack and its exported `__stack_pointer`,
+//! which its own build script asks for as this crate's does. `examples/embedded.rs` is one.
 
 // A value keeps its hash once it is computed, and that is all it ever changes of itself: neither its hash nor what it
 // is equal to moves, so it is a sound key, whatever clippy makes of the cell.
@@ -82,10 +93,13 @@ fn set_result(bytes: Vec<u8>) {
     codec::recycle(before);
 }
 
+pub use ops::{extend, Extension};
+
 /// What the module sets up once, before its first operation: where its failures are told, the generator `rand`,
 /// `rand-int` and the sampling aggregates draw from, and the tables the port builds the first time it needs them,
-/// which are built here, where the host's stack is as shallow as it gets.
-fn init() {
+/// which are built here, where the host's stack is as shallow as it gets. A program the module is built into calls
+/// it as it starts, before it sets up anything of its own that this would undo: the hook its panics are told by.
+pub fn start() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Relaxed) {
         return;
@@ -135,7 +149,7 @@ fn error_value(e: &Error) -> Value {
 /// `ptr` is memory from `ds_alloc(len)`, written by the host, and not used by it again.
 #[no_mangle]
 pub unsafe extern "C" fn ds_call(op: u32, ptr: *mut u8, len: usize) -> u32 {
-    init();
+    start();
     let message = take(ptr, len);
     let args = Reader::new(&message).value();
     drop(message);
@@ -222,7 +236,7 @@ pub extern "C" fn ds_recover() {
 /// `ptr` is memory from `ds_alloc(len)` holding UTF-8, and not used by the host again.
 #[no_mangle]
 pub unsafe extern "C" fn ds_edn(ptr: *mut u8, len: usize) -> u32 {
-    init();
+    start();
     let message = take(ptr, len);
     let (status, text) = match std::str::from_utf8(&message) {
         Ok(text) => edn_api::call(text),

@@ -1125,6 +1125,12 @@
     (.clear sym-ids)
     (set! kws (array))
     (set! syms (array))
+    ;; and so is what is held: an instance before lets go of nothing more of the host's, and its
+    ;; functions are none of this one's
+    (set! host-fns (handles))
+    (set! host-objs (handles))
+    (.clear module-fns)
+    (set! (.-length let-go) 0)
     (set! mem-u8 (js/Uint8Array. 0))
     (set! unrecovered false)
     (when (some? on-attach)

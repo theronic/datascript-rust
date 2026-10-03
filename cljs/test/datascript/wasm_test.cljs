@@ -36,7 +36,8 @@
     datascript.test.upsert
     datascript.test.issues
     datascript.test.datafy
-    datascript.test.wasm))
+    datascript.test.wasm
+    datascript.test.embedded))
 
 (defn -main [& _]
   ;; the tests that wait for the garbage collector end after this function does

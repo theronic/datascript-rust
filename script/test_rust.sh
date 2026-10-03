@@ -18,6 +18,8 @@ node crates/datascript-wasm/js/leaf-check.mjs target/named/wasm32-unknown-unknow
 ./conformance/run-wasm.sh
 ./cljs/test.sh
 ./cljs/test.sh advanced
+# the module built into another program (crates/datascript-wasm/examples/embedded.rs), with that program's operations
+./cljs/test.sh simple embedded
 ./cljs/js-api.sh
 node crates/datascript-wasm/js/test-edn.mjs
 echo "the Rust port: all checks passed"
